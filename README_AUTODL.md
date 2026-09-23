@@ -10,7 +10,10 @@
 | `infer.py` | 生成官方格式的 `pred_results.csv` |
 | `losses.py` | 鲁棒损失：CE / GCE / NCE / RCE / APL |
 | `noise.py` | 逐样本标签可信度跟踪、噪声过滤与伪标签纠正 |
+| `analyze.py` | 训练后的错误分析报告（哪些类坏了、混淆是不是单向的）。`selftest.py` 会 import 它 |
 | `selftest.py` | **先跑这个**：10 秒自检，不需要数据 / GPU / CLIP 权重 |
+| `valmetrics.py` | 对**已有 checkpoint** 算 micro / macro 准确率并排对比，零训练成本。用来判断"排行榜分数比 `val_acc` 低"是不是度量口径造成的。**脚本会自检：`val_acc` 必须等于训练日志里的值** |
+| `perclass.py` | 对**已有 checkpoint** 打召回率分布直方图 + 每个坏类被误判成了什么。诊断"哪些类卡死了" |
 
 ## 1. 方法
 
@@ -53,7 +56,9 @@
 
 **Step 1 上传** FileZilla → 主机填实例的 `region.autodl.com`，**端口填 SSH 登录指令里 `-p` 后面的那个数字**（不是 22），协议 `SFTP`，用户 `root`，密码为实例密码。
 
-* 代码：`train.py` / `infer.py` / `losses.py` / `noise.py` / `selftest.py` / `requirements.txt` → `/root/autodl-tmp/`
+* 代码：`train.py` / `infer.py` / `losses.py` / `noise.py` / `analyze.py` / `selftest.py` /
+  `requirements.txt` → `/root/autodl-tmp/`。**7 个文件必须放在同一层目录**——`train.py`
+  import `losses`/`noise`，`selftest.py` import 其余全部。别传 `__pycache__/`
 * 数据：几万张小文件用 FileZilla 传极慢，**先在本地打成 zip**，上传后 `unzip train.zip -d /root/autodl-tmp/`
   （Windows 下用 `tar -a -c -f train.zip train` 或右键压缩；AutoDL 上 `apt install unzip -y` 若缺）
 
@@ -93,28 +98,47 @@ python selftest.py
 输出 `ALL CHECKS PASSED` 才继续。它会用桩模型跑完一次完整的 4 轮训练 + 推理 + CSV 校验。
 
 **Step 5 冒烟测试（先跑 1 个 epoch 的 20 步）**
+
+用**和 Step 6 完全一样的 batch-size / workers**，否则测不出正式运行时会不会爆显存：
 ```bash
 python train.py --data /root/autodl-tmp/train --out ./outputs \
-  --epochs 1 --warmup-epochs 1 --limit-batches 20 --batch-size 64 --workers 8
+  --epochs 1 --warmup-epochs 1 --limit-batches 20 --batch-size 128 --workers 12
 ```
-另开终端 `watch -n 1 nvidia-smi` 看显存与 GPU 利用率。**如果 GPU 利用率长期低于 60%，说明是数据加载瓶颈**，把 `--workers` 加到 12~16。
+另开终端 `watch -n 1 nvidia-smi` 看显存与 GPU 利用率。**如果 GPU 利用率长期低于 60%，说明是数据加载瓶颈**，把 `--workers` 加到 16~20。
+
+冒烟测试看三件事，**不看准确率**（只跑了 20 步，`noise stats` 必然是乱的）：
+
+1. **不报错**：`CUDA out of memory` / `DataLoader worker ... killed` 都要在这一步暴露，别留到两小时的正式训练；
+2. **显存**：应明显低于 24 GB，留出余量；
+3. **速度**：日志里 `time=xx.xs` 是这 20 步的耗时，`20 步 × (训练集/128) ÷ 步速` 就是一轮的真实时间，
+   乘 20 轮再乘 2（两个分支）就是总预算。先算清楚再开跑。
 
 **Step 6 正式训练**
 ```bash
 python train.py --data /root/autodl-tmp/train --out ./outputs \
-  --pretrained /root/autodl-tmp/ViT-B-32.pt \
   --epochs 20 --warmup-epochs 3 --batch-size 128 --workers 12
 ```
+
+> **不要加 `--pretrained`。** 默认值 `openai` 就是对的：Step 3 走镜像下好的权重已经在
+> `~/.cache/huggingface/` 里，`open_clip` 直接命中缓存。只有当你走的是 Step 3 下半段那条
+> `wget ...ViT-B-32.pt` 的路子时，才需要 `--pretrained /root/autodl-tmp/ViT-B-32.pt`
+> ——那个文件不存在的话这一步会直接报错；而且 `train.py` 看到 `--pretrained` 不是 `openai`
+> 会打一条"可能不符合规则"的警告（规则 五.1），属于误报，别被它吓到，也别因此改成别的值。
 中断了就 `--resume ./outputs/last.pt` 续训（记得带上其余参数）。
 
 **Step 7 推理 + 提交**
 ```bash
 unzip test.zip -d /root/autodl-tmp/                 # 得到 /root/autodl-tmp/test/*.jpg
-python infer.py --test /root/autodl-tmp/test --checkpoint outputs/best.pt --output pred_results.csv
-wc -l pred_results.csv                              # 初赛应为 24967
+python infer.py --test /root/autodl-tmp/test --checkpoint outputs/best.pt \
+  --output pred_results.csv --logit-adjust 0 0.25 0.5
+wc -l pred_results.csv                              # 初赛 24967 / 复赛 37444
 head -3 pred_results.csv                            # 形如 00012f3f....jpg,0007
 zip submission.zip pred_results.csv
 ```
+
+> `--logit-adjust` 一次前向出多个文件（`pred_results.csv` / `..._tau025.csv` / `..._tau050.csv`），
+> **每个 tau 都是一份合法提交**，可以分别上排行榜试。它只在"训练集不均衡、测试集均衡"时才有用——
+> 复赛训练集实测近乎均衡（见 HANDOFF §14.1），所以**预期收益很小**，当 tie-breaker 用就好。
 
 ## 3. 常用参数
 
@@ -125,10 +149,9 @@ zip submission.zip pred_results.csv
 | `--tau-conf` | 0.8 | 教师**否定**给定标签时，要多自信才敢改标注 |
 | `--w-noise` / `--w-relabel` | 0.1 / 0.5 | 不可信样本 / 被改标注样本的损失权重 |
 | `--max-noise-frac` | 0.4 | 最多判定多少比例的样本为不可信（防止教师未收敛时误杀） |
-
-> `noise stats` 里的四个数（`clean` / `relabel` / `noisy` / `unseen`）**加起来等于训练集大小**。
-> 如果 `noisy` 恰好等于 `max_noise_frac × N`，说明它长期撞在上限上——阈值对这个模型不成立，需要调。
-| `--robust-loss` | apl | `apl`（NCE+RCE）/ `gce` / `nce` / `ce`，建议做消融 |
+| `--relabel-mix` | 0.5 | 改标注时有多少目标质量移到教师的选择上。`1.0` = 硬覆盖（旧行为） |
+| `--label-smooth` | 0.05 | CE 项的标签平滑——抗"记忆结构化噪声"最便宜的一条 |
+| `--robust-loss` | apl | `apl`（NCE+RCE）/ `gce` / `nce` / `rce` / `ce`，建议做消融 |
 | `--robust-weight` | 0.5 | 鲁棒损失权重 |
 | `--apl-k` / `--apl-rce` | 0.2 / 1.0 | NCE 拐点；RCE 缩放（调小更温和） |
 | `--proto-weight` | 0.5 | 原型对比损失权重 |
@@ -137,6 +160,10 @@ zip submission.zip pred_results.csv
 | `--val-ratio` | 0.1 | 验证集比例；定稿冲分时可降到 0.05 |
 | `--select` | val_acc | 选最佳权重依据，可换 `val_acc_hi` |
 | `--save-every` | 4 | 每 N 轮额外存一个 `epN.pt`（0 = 只留 best/last）。**这是拿真实排行榜选轮次的唯一手段**，见下文 |
+
+> `noise stats` 里的四个数（`clean` / `relabel` / `noisy` / `unseen`）**加起来必须等于训练集大小**。
+> 如果 `noisy` 恰好等于 `max_noise_frac × N`，说明它长期撞在上限上——阈值对这个模型不成立，需要调。
+> 另外 `mean_weight` 是平均样本权重，跌破 0.35 时会自动打 `!! 警告`（等于大部分数据不产生梯度）。
 
 > **`val_acc` 会高估真实水平，不要只信它。** 验证集是从训练集里切出来的，**带着同一套结构化噪声**。
 > 设真实准确率为 `a`、噪声比例 `η`：如果噪声是随机的、模型又完全抵抗住了，那么
@@ -154,6 +181,23 @@ zip submission.zip pred_results.csv
 > 注意：APL 里的 NCE 是“主动”损失，**warm-up 之后打印的 loss 可能为负**（`k=0.2` 时下界约 `-2.39`），这是设计如此，不是发散。
 
 ## 4. 建议的消融顺序（每项单独跑，别一次全改）
+
+**复赛最该先做的对照**是"抗记忆三件套"整体开关，因为它是本轮唯一的算法改动方向：
+
+0. **新默认 vs 旧行为** → 默认（`--label-smooth 0.05 --relabel-mix 0.5`）
+   vs `--out ./outputs_old --label-smooth 0 --relabel-mix 1.0`。
+   **两边同一轮次各提交一次比排行榜**——别比 `val_acc`，`val_acc` 奖励的正是我们要避免的行为。
+
+   > **实测修正（2026-09-23，见 HANDOFF §15.2）**：这个 A/B **并不干净**。
+   > `relabel` 在两个分支里都只占 **1.7%** 的样本，所以 `--relabel-mix` 0.5 vs 1.0
+   > 几乎没有区别——**这一对实际上只在比 `--label-smooth` 0.05 vs 0**。
+   > 想单独测伪标签纠正，得先把 `--tau-conf` 从 0.8 调低（750 类下 argmax 置信度
+   > 到不了 0.8，这套机制等于没开）。
+   >
+   > 另外：`val_loss` **不能跨分支比**（两边损失函数定义不同），跨分支唯一可比的是 `val_acc`。
+   > 而 `val_acc` 在这个数据集上会高估 6.5 点（HANDOFF §15.4），所以**只有排行榜能裁决**。
+
+然后：
 
 1. 原版 GCE vs 新的 **APL** → `--robust-loss gce` vs `apl`；
 2. 关掉噪声筛选/纠正 → `--w-noise 1 --w-relabel 1`（等价于只做置信度重加权）；

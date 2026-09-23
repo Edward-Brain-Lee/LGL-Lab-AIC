@@ -24,21 +24,32 @@ class LabelTrustTracker:
     confidence -- see :meth:`refresh` for why an absolute gate does not work.
     Decision rule applied in :meth:`refresh` (after warm-up):
 
-    ==================================================  ==============  ==============
-    condition                                           label           weight
-    ==================================================  ==============  ==============
-    ``argmax p == y`` (teacher agrees)                  given ``y``     ``1.0``
-    disagrees and ``max(p) >= tau_conf``                ``argmax p``    ``w_relabel``
-    disagrees and ``max(p) <  tau_conf``                given ``y``     ``w_noise``
-    ==================================================  ==============  ==============
+    ==================================================  ==================  ==============
+    condition                                           target              weight
+    ==================================================  ==================  ==============
+    ``argmax p == y`` (teacher agrees)                  ``y``               ``1.0``
+    disagrees and ``max(p) >= tau_conf``                ``mix(y, argmax)``  ``w_relabel``
+    disagrees and ``max(p) <  tau_conf``                ``y``               ``w_noise``
+    ==================================================  ==================  ==============
 
     Samples the sampler has not drawn yet keep the given label at weight 1.
     ``max_noise_frac`` caps how much of the set may be declared untrusted, so a
     cold teacher early in training cannot throw away most of the data.
+
+    The middle row is a **mixture**, not an overwrite: ``relabel_mix`` of the
+    target mass moves onto the teacher's pick and ``1 - relabel_mix`` stays on
+    the given label.  The brief describes the noise as *weakly correlated*
+    annotation -- the given label is wrong but related -- and in that regime a
+    confident disagreement is frequently not a wrong label at all but a
+    genuinely confusable neighbour.  A hard overwrite would promote that
+    confusion to ground truth and teach the model exactly the error we are
+    trying to avoid; hedging keeps the given label's evidence alive while still
+    letting the teacher pull.
     """
 
     def __init__(self, targets, nclass, momentum=0.9, tau_conf=0.8,
-                 w_noise=0.1, w_relabel=0.5, max_noise_frac=0.4, device='cpu'):
+                 w_noise=0.1, w_relabel=0.5, max_noise_frac=0.4,
+                 relabel_mix=0.5, device='cpu'):
         self.device = device
         self.y = torch.as_tensor(targets, dtype=torch.long, device=device)
         self.n, self.nclass = self.y.numel(), nclass
@@ -46,11 +57,14 @@ class LabelTrustTracker:
         self.tau_conf = tau_conf
         self.w_noise, self.w_relabel = w_noise, w_relabel
         self.max_noise_frac = max_noise_frac
+        self.relabel_mix = relabel_mix
 
         self.prob = torch.zeros(self.n, nclass, device=device)
         self.seen = torch.zeros(self.n, dtype=torch.bool, device=device)
         self.label = self.y.clone()
         self.weight = torch.ones(self.n, device=device)
+        self.pred = self.y.clone()                       # teacher top-1, per sample
+        self.mix = torch.zeros(self.n, device=device)    # target mass on `pred`
         self.stats = {}
 
     @torch.no_grad()
@@ -102,22 +116,51 @@ class LabelTrustTracker:
         self.weight = torch.where(relabel, torch.full_like(trust, self.w_relabel),
                                   torch.where(noisy, torch.full_like(trust, self.w_noise),
                                               torch.ones_like(trust)))
+        self.pred = pred
+        self.mix = torch.where(relabel, torch.full_like(trust, self.relabel_mix),
+                               torch.zeros_like(trust))
         self.stats = {
             'clean': int(clean.sum()), 'relabel': int(relabel.sum()),
             'noisy': int(noisy.sum()), 'unseen': int((~judged).sum()),
             'capped': capped,           # rescued from `noisy` by max_noise_frac
             'mean_trust': float(trust[judged].mean()) if bool(judged.any()) else 0.0,
+            # How much of the training signal survives the weighting.  A collapse
+            # here means the filtering is throwing the set away, which is worth
+            # seeing in the log rather than inferring from the accuracy.
+            'mean_weight': float(self.weight.mean()),
         }
         return self.stats
 
+    @torch.no_grad()
+    def target(self, idx, y):
+        """Soft target ``(B, C)`` for one batch, **without** label smoothing.
+
+        Non-relabelled samples get a one-hot on the given label; a relabelled one
+        gets ``(1 - mix) * given + mix * teacher_pick`` -- see the class
+        docstring for why the mixture rather than an overwrite.
+        """
+        c = self.nclass
+        t = F.one_hot(y, c).to(torch.float32)
+        m = self.mix[idx][:, None]
+        if bool((m > 0).any()):
+            t = (1 - m) * t + m * F.one_hot(self.pred[idx], c).to(torch.float32)
+        return t
+
     def state_dict(self):
-        return {'prob': self.prob, 'seen': self.seen, 'label': self.label, 'weight': self.weight}
+        return {'prob': self.prob, 'seen': self.seen, 'label': self.label, 'weight': self.weight,
+                'pred': self.pred, 'mix': self.mix}
 
     def load_state_dict(self, sd):
         self.prob.copy_(sd['prob'].to(self.device))
         self.seen.copy_(sd['seen'].to(self.device))
         self.label.copy_(sd['label'].to(self.device))
         self.weight.copy_(sd['weight'].to(self.device))
+        # tolerating their absence keeps checkpoints written before the mixed
+        # target existed loadable
+        if 'pred' in sd:
+            self.pred.copy_(sd['pred'].to(self.device))
+        if 'mix' in sd:
+            self.mix.copy_(sd['mix'].to(self.device))
 
 
 def prototype_bootstrap(sum_feats, counts):

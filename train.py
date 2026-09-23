@@ -9,11 +9,13 @@ Recipe
    the pretrained prior survives;
 2. **class-balanced sampling** (``1/sqrt(freq)``) for the long-tailed stages;
 3. a pure-CE **warm-up**, after which an **EMA teacher** drives
-   * automatic noise filtering + pseudo-label correction (DivideMix / co-teaching
-     style, see ``noise.py``),
+   * automatic noise filtering + *mixed* pseudo-labels (DivideMix / co-teaching
+     style, see ``noise.py``): the teacher moves only ``--relabel-mix`` of the
+     target mass off the given label instead of overwriting it,
    * confidence re-weighting of whatever is left;
 4. an **active-passive loss** (NCE + RCE, Ma et al., ICML 2020) that cannot be
-   fooled by a memorised wrong sample;
+   fooled by a memorised wrong sample.  It sees the mixed target but *not* the
+   label smoothing (see ``losses.nce``); smoothing only touches the CE term;
 5. **EMA class prototypes** + cosine prototype contrastive loss (MoPro /
    Sel-CL style), bootstrapped from the frozen-CLIP class means;
 6. **two-view consistency** and a **frozen-CLIP anchor** term to suppress
@@ -41,7 +43,7 @@ from torchvision import transforms
 
 import open_clip
 
-from losses import make_robust_loss
+from losses import ce as xent, make_robust_loss
 from noise import LabelTrustTracker, prototype_bootstrap
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -49,6 +51,37 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 IMG_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+
+# Competition rule 五.1 / 十一(一).1: the backbone *has* to be CLIP ViT-B/32 --
+# no other or larger visual model.  These are the only open_clip names that are
+# that architecture ('-quickgelu' is the correct one for the official OpenAI
+# weights, see the note on --model).  Checked instead of merely documented,
+# because `--model ViT-L-14` would otherwise train happily and be disqualified.
+ALLOWED_BACKBONES = {'ViT-B-32-quickgelu', 'ViT-B-32'}
+
+
+def check_backbone(name):
+    if name not in ALLOWED_BACKBONES:
+        raise SystemExit(
+            f'backbone {name!r} is not allowed. The competition requires CLIP ViT-B/32 '
+            f'(allowed open_clip names: {sorted(ALLOWED_BACKBONES)}).')
+
+
+def smooth_target(t, smooth, nclass):
+    """Mix a one-hot-ish target towards uniform.
+
+    Label smoothing is the cheapest defence against the failure this project
+    actually measured: on the 500-class round the hold-out accuracy (0.7305)
+    came out *above* the leaderboard score (0.6802), which is only possible if
+    the model memorised the class-consistent part of the label noise.  Smoothing
+    caps how confident a single (possibly wrong) label can make the model, so
+    there is less to memorise.
+
+    It is applied to the CE term only -- see the note in ``losses.nce``.
+    """
+    if smooth <= 0:
+        return t
+    return (1 - smooth) * t + smooth / nclass
 
 
 # --------------------------------------------------------------------------- #
@@ -384,7 +417,31 @@ def evaluate(model, loader, device, amp_dtype, use_amp):
     return total_loss / n, correct / n, (correct_hi / n_hi if n_hi else 0.0)
 
 
+# what an inference-only checkpoint needs; everything else (optimiser, RNG,
+# tracker) is only read back by `--resume`, which only ever loads `last.pt`
+SNAPSHOT_KEYS = ('model', 'classes', 'class_counts', 'args', 'epoch', 'val_acc',
+                 'val_acc_hi', 'lora_rank', 'lora_target', 'pretrained', 'model_name')
+
+
+def thin(ck):
+    """Inference-only view of a checkpoint.
+
+    The tracker's posterior is ``n_train x n_class`` floats -- 446 MB on this
+    round's 148695x750 set -- and the optimiser state is comparable.  Writing
+    both into every ``best.pt`` / ``epN.pt`` cost ~3 GB of the data disk per run
+    for data that inference never reads.  The snapshots exist to be scored on the
+    leaderboard, so they only need the weights.
+    """
+    return {k: ck[k] for k in SNAPSHOT_KEYS if k in ck}
+
+
 def main(a):
+    check_backbone(a.model)
+    if a.pretrained != 'openai':
+        # rule 十一(二).3 allows only the official OpenAI ViT-B/32 weights; a local
+        # path cannot be verified, so say so rather than silently trusting it
+        print(f'WARNING: --pretrained {a.pretrained!r} is not the "openai" tag -- the rules '
+              f'allow only the official OpenAI ViT-B/32 weights, make sure that file is exactly those.')
     seed_everything(a.seed, deterministic=not a.cudnn_benchmark)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     out_dir = Path(a.out)
@@ -393,6 +450,11 @@ def main(a):
     tr, va = build_datasets(a)
     loader, vloader = build_loaders(a, tr, va)
     nclass = len(tr.class_to_idx)
+    # per-class counts, in class-index order -- saved into the checkpoint so that
+    # infer.py can offer post-hoc logit adjustment (the test set is balanced, the
+    # training set is not, so the two priors differ)
+    freq = Counter(tr.targets)
+    class_counts = [freq.get(i, 0) for i in range(nclass)]
     print(f'classes={nclass} train={len(tr)} val={len(va)} device={device} amp={a.amp}')
     print('config: ' + ' '.join(f'{k}={v}' for k, v in sorted(vars(a).items())))
 
@@ -413,7 +475,7 @@ def main(a):
     tracker = LabelTrustTracker(tr.targets, nclass, momentum=a.noise_momentum,
                                 tau_conf=a.tau_conf, w_noise=a.w_noise,
                                 w_relabel=a.w_relabel, max_noise_frac=a.max_noise_frac,
-                                device=device)
+                                relabel_mix=a.relabel_mix, device=device)
     robust = make_robust_loss(a.robust_loss, a.gce_q, a.apl_k, a.apl_b, a.apl_rce)
 
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
@@ -426,7 +488,11 @@ def main(a):
     except (AttributeError, TypeError):
         scaler = torch.cuda.amp.GradScaler(enabled=use_amp and a.amp == 'fp16')
 
-    start_epoch, best = 0, 0.0
+    # -1.0, not 0.0: with --select val_acc_hi the score is 0.0 for exactly as
+    # long as no sample clears max(p) >= 0.8, which on 750 classes can hold for
+    # the first epochs -- and `score > best` would then write no best.pt at all.
+    # Starting below every possible score guarantees the first epoch lands one.
+    start_epoch, best = 0, -1.0
     if a.resume:
         ck = torch.load(a.resume, map_location='cpu', weights_only=False)
         model.load_state_dict(ck['model'], strict=False)
@@ -441,7 +507,7 @@ def main(a):
             torch.cuda.set_rng_state_all(ck['rng']['cuda'])
         random.setstate(ck['rng']['python'])
         start_epoch = ck['epoch'] + 1
-        best = ck.get('val_acc' if a.select == 'val_acc' else 'val_acc_hi', 0.0)
+        best = ck.get('val_acc' if a.select == 'val_acc' else 'val_acc_hi', -1.0)
         print(f'resumed from {a.resume} at epoch {start_epoch} (best={best:.4f})')
 
     probe = next(iter(loader))
@@ -451,7 +517,26 @@ def main(a):
     for ep in range(start_epoch, a.epochs):
         warm = ep < a.warmup_epochs
         if not warm:
-            print('noise stats:', tracker.refresh())
+            st = tracker.refresh()
+            print('noise stats:', st)
+            # A degenerate tracker is completely silent otherwise.  On the first
+            # real run the 40% cap pinned on all 20 epochs and the four counts did
+            # not even add up to the training set -- nothing in the log said so,
+            # and a full GPU run was spent before it was noticed.  On a brand-new
+            # dataset these thresholds have never been calibrated, so say it now.
+            if st['clean'] + st['relabel'] + st['noisy'] + st['unseen'] != len(tr):
+                print(f'  !! 警告: 四个统计量加起来 {st["clean"] + st["relabel"] + st["noisy"] + st["unseen"]}'
+                      f' != 训练集大小 {len(tr)}，划分逻辑坏了，这次训练的结果不可信。')
+            if st['capped'] > 0:
+                print(f'  !! 警告: 有 {st["capped"]} 个样本撞到了 --max-noise-frac={a.max_noise_frac} 上限。'
+                      f'判据对这个数据集不成立，调 --tau-conf 或 --max-noise-frac。')
+            if st['relabel'] == 0 and ep >= a.warmup_epochs + 1:
+                print(f'  !! 警告: 至今没有任何样本被改标注。{nclass} 类下的 argmax 置信度'
+                      f'很难达到 --tau-conf={a.tau_conf}，考虑调低它。')
+            if st['mean_weight'] < 0.35:
+                print(f'  !! 警告: 平均样本权重跌到 {st["mean_weight"]:.3f}，'
+                      f'绝大多数样本几乎不产生梯度，等于只用了很小一部分数据。'
+                      f'调 --max-noise-frac 或 --w-noise。')
 
         model.train()
         t0 = time.time()
@@ -478,22 +563,30 @@ def main(a):
             tracker.update(idx_g, tprob)                # free: the teacher already ran
 
             if warm:
-                # pure supervised warm-up on the raw labels
-                y_used = y
+                # pure supervised warm-up on the raw labels; there is no teacher
+                # mixture yet, so both targets coincide
+                hard = y
+                mix_t = soft = smooth_target(F.one_hot(y, nclass).to(torch.float32),
+                                             a.label_smooth, nclass)
                 w = torch.ones(bsz, device=device)
             else:
-                y_used = tracker.label[idx_g]           # possibly corrected label
+                hard = tracker.label[idx_g]             # possibly corrected label
+                # `mix_t` carries the teacher mixture and is what the robust loss
+                # sees; `soft` adds label smoothing and is the CE target.  They
+                # differ on purpose -- see the note in losses.nce.
+                mix_t = tracker.target(idx_g, y)
+                soft = smooth_target(mix_t, a.label_smooth, nclass)
                 w = tracker.weight[idx_g] * tprob.max(1).values.clamp(a.conf_floor, 1.0).pow(a.conf_gamma)
                 if a.norm_weights:
                     # keep the effective step size stable as filtering kicks in
                     w = w / w.mean().clamp_min(1e-6)
 
             # labelled pass on both views (the "passive" term)
-            ce1 = F.cross_entropy(out.float(), y_used, reduction='none')
-            ce2 = F.cross_entropy(out2.float(), y_used, reduction='none')
+            ce1 = xent(out, soft)
+            ce2 = xent(out2, soft)
             loss = 0.5 * ((w * ce1).mean() + (w * ce2).mean())
             if not warm and a.robust_weight > 0:
-                rob = 0.5 * (robust(out, y_used) + robust(out2, y_used))
+                rob = 0.5 * (robust(out, mix_t) + robust(out2, mix_t))
                 loss = loss + a.robust_weight * (w * rob).mean()
             if a.consistency_weight > 0:
                 loss = loss + a.consistency_weight * F.mse_loss(z, z2.detach())
@@ -504,8 +597,7 @@ def main(a):
                 trusted = tracker.weight[idx_g] >= a.proto_min_weight
                 pl = model.proto.logits(torch.cat([z, z2], 0))
                 pw = w.repeat(2)
-                loss = loss + a.proto_weight * (pw * F.cross_entropy(pl, y_used.repeat(2),
-                                                                     reduction='none')).mean()
+                loss = loss + a.proto_weight * (pw * xent(pl, mix_t.repeat(2, 1))).mean()
 
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -524,7 +616,10 @@ def main(a):
                     boot_sum.index_add_(0, y, anchor)       # frozen-CLIP class means
                     boot_cnt.index_add_(0, y, torch.ones(bsz, device=device))
                 if a.proto_weight > 0 and not warm:
-                    model.proto.update(tz, y_used, trusted)
+                    # the prototype EMA still needs a hard assignment: averaging
+                    # features under a soft target would let a confused sample
+                    # drag two prototypes at once
+                    model.proto.update(tz, hard, trusted)
 
             running += loss.item() * bsz
             seen += bsz
@@ -542,6 +637,7 @@ def main(a):
               f'lr={opt.param_groups[0]["lr"]:.2e} time={time.time() - t0:.1f}s')
 
         ck = {'model': model.trainable_state_dict(), 'classes': tr.class_to_idx,
+              'class_counts': class_counts,
               'args': vars(a), 'epoch': ep, 'val_acc': va_acc, 'val_acc_hi': va_hi,
               'lora_rank': a.lora_rank, 'lora_target': a.lora_target, 'pretrained': a.pretrained,
               'model_name': a.model,
@@ -556,10 +652,10 @@ def main(a):
             # -- which costs accuracy on the clean test set.  Keep snapshots so
             # several epochs can be scored on the real leaderboard and the best
             # one picked, instead of trusting a proxy that rewards the failure.
-            torch.save(ck, out_dir / f'ep{ep + 1}.pt')
+            torch.save(thin(ck), out_dir / f'ep{ep + 1}.pt')
         if score > best:
             best = score
-            torch.save(ck, out_dir / 'best.pt')
+            torch.save(thin(ck), out_dir / 'best.pt')
             print(f'  -> new best ({a.select}={best:.4f}) saved to {out_dir / "best.pt"}')
 
     print(f'best {a.select} = {best:.4f}')
@@ -602,7 +698,7 @@ def parse_args(argv=None):
     p.add_argument('--randaug-n', type=int, default=2)
     p.add_argument('--randaug-m', type=int, default=9)
 
-    p.add_argument('--robust-loss', default='apl', choices=['ce', 'gce', 'nce', 'apl'])
+    p.add_argument('--robust-loss', default='apl', choices=['ce', 'gce', 'nce', 'rce', 'apl'])
     p.add_argument('--robust-weight', type=float, default=0.5)
     p.add_argument('--gce-q', type=float, default=0.7)
     p.add_argument('--apl-k', type=float, default=0.2)
@@ -615,6 +711,18 @@ def parse_args(argv=None):
     p.add_argument('--w-noise', type=float, default=0.1)
     p.add_argument('--w-relabel', type=float, default=0.5)
     p.add_argument('--max-noise-frac', type=float, default=0.4)
+    p.add_argument('--relabel-mix', type=float, default=0.5,
+                   help='fraction of the target mass that moves onto the teacher\'s pick when a '
+                        'sample is confidently relabelled (1.0 = hard overwrite). The brief calls '
+                        'the noise "weakly correlated" -- the given label is wrong but related -- '
+                        'and in that regime a confident disagreement is often a genuinely '
+                        'confusable neighbour rather than a wrong label, so a hard overwrite '
+                        'would promote exactly that confusion to ground truth.')
+    p.add_argument('--label-smooth', type=float, default=0.05,
+                   help='label smoothing on the CE term. Cheapest defence against the failure '
+                        'this project actually measured: val_acc (0.7305) came out above the '
+                        'leaderboard score (0.6802), which is only possible if the model '
+                        'memorised the class-consistent part of the label noise.')
     p.add_argument('--conf-gamma', type=float, default=2.0)
     p.add_argument('--conf-floor', type=float, default=0.1)
     p.add_argument('--norm-weights', type=int, default=1)

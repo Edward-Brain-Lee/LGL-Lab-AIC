@@ -1,5 +1,6 @@
 torch>=2.1
 torchvision>=0.16
-open_clip_torch>=2.24
+# pinned: the code is written against 3.3.0's `create_model` / weight-tag
+# behaviour, and an unpinned `pip install -r` would silently upgrade it
+open_clip_torch==3.3.0
 Pillow>=10.0
-tqdm>=4.66

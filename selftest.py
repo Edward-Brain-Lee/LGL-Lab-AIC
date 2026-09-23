@@ -5,13 +5,17 @@
 It needs no dataset, no GPU and no CLIP weights -- ``open_clip`` is replaced by
 a tiny stub exposing the same interface.  Covered:
 
-* robust losses: shapes, GCE bound, NCE tangency/continuity at ``p = k``;
+* robust losses: shapes, GCE bound, NCE tangency/continuity at ``p = k``, and
+  the soft-target form reducing exactly to the index form on a one-hot target;
 * label-trust tracker: agree / pseudo-label / untrusted branches, rejection cap,
   statistics that partition the set, EMA update;
+* targets: label smoothing, and the tracker's mixed pseudo-label (the given
+  label keeps ``1 - relabel_mix`` of the mass -- not a hard overwrite);
 * prototype head: bootstrap, EMA update, classes never seen before;
 * LoRA: zero-init identity, disable == frozen CLIP, checkpoint filtering;
 * a full 4-epoch training run and a full inference run on a throw-away
-  4-class image set, including the checkpoint round-trip and the CSV format.
+  4-class image set, including the checkpoint round-trip, the inference-only
+  snapshots, the CSV format and the multi-tau logit adjustment.
 """
 import csv
 import math
@@ -85,6 +89,7 @@ _stub = types.ModuleType('open_clip')
 _stub.create_model = lambda name, pretrained=None: _StubCLIP()
 sys.modules['open_clip'] = _stub
 
+import analyze  # noqa: E402
 import infer  # noqa: E402
 import losses  # noqa: E402
 import noise  # noqa: E402
@@ -94,7 +99,7 @@ import train  # noqa: E402
 def check_losses():
     torch.manual_seed(0)
     logits, y = torch.randn(8, 5), torch.randint(0, 5, (8,))
-    for name in ('ce', 'gce', 'nce', 'apl'):
+    for name in ('ce', 'gce', 'nce', 'rce', 'apl'):
         v = losses.make_robust_loss(name)(logits, y)
         assert v.shape == (8,), f'{name}: expected shape (8,), got {tuple(v.shape)}'
         assert torch.isfinite(v).all(), f'{name}: non-finite loss'
@@ -126,6 +131,23 @@ def check_losses():
     worst = losses.rce(logits * 50, y)
     assert 0.0 <= float(worst.min()) and float(worst.max()) <= -math.log(1e-4) + 1e-6, \
         f'RCE left its [0, {(-math.log(1e-4)):.2f}] range'
+
+    # the distribution form must be a pure generalisation: on a one-hot target it
+    # has to reproduce the index form exactly, or the mixed pseudo-labels and the
+    # label smoothing would silently change the objective that was tuned
+    onehot = F.one_hot(y, 5).float()
+    for name in ('ce', 'gce', 'nce', 'rce', 'apl'):
+        f = losses.make_robust_loss(name)
+        assert torch.allclose(f(logits, onehot), f(logits, y), atol=1e-6), \
+            f'{name}: one-hot distribution disagrees with the index form'
+        assert f(logits, onehot).shape == (8,), f'{name}: soft target changed the output shape'
+
+    # CE is linear in the target, so a 50/50 mixture must be the mean of the two
+    y2 = (y + 1) % 5
+    half = 0.5 * onehot + 0.5 * F.one_hot(y2, 5).float()
+    assert torch.allclose(losses.ce(logits, half),
+                          0.5 * (losses.ce(logits, y) + losses.ce(logits, y2)), atol=1e-6), \
+        'CE is not linear in the target distribution'
     print('  losses ok')
 
 
@@ -212,6 +234,65 @@ def check_tracker():
     print('  tracker ok')
 
 
+def check_targets():
+    """Label smoothing, and the tracker's *mixed* pseudo-label."""
+    t = F.one_hot(torch.tensor([1, 3]), 5).float()
+    s = train.smooth_target(t, 0.1, 5)
+    assert torch.allclose(s.sum(1), torch.ones(2)), 'a smoothed target must still sum to 1'
+    # 0.9 on the target *plus* the 0.1/5 that smoothing puts on every class
+    assert torch.allclose(s[:, 1], torch.tensor([0.92, 0.02]), atol=1e-6), s
+    assert torch.allclose(s[:, 3], torch.tensor([0.02, 0.92]), atol=1e-6), s
+    assert torch.allclose(train.smooth_target(t, 0.0, 5), t), 'smooth=0 must be a no-op'
+
+    # tracker.target(): mix == 0 -> a hard one-hot; mix == m -> m on the teacher's
+    # pick and 1 - m still on the given label.  The point is the hedge: under
+    # weakly-correlated annotation noise a hard overwrite promotes the teacher's
+    # confusion to ground truth.
+    C, n = 5, 6
+    y = torch.tensor([0, 1, 2, 3, 4, 0])
+    tk = noise.LabelTrustTracker(y.tolist(), C, momentum=0.0, max_noise_frac=1.0,
+                                 relabel_mix=0.25)
+    tk.pred[:] = (y + 1) % C
+    tk.mix[:] = 0.0
+    tk.mix[[1, 4]] = 0.25
+    tg = tk.target(torch.arange(n), y)
+    assert tg.shape == (n, C), tg.shape
+    assert torch.allclose(tg.sum(1), torch.ones(n)), 'targets must be distributions'
+    kept = [0, 2, 3]
+    assert torch.allclose(tg[kept], F.one_hot(y[kept], C).float()), \
+        'a sample with mix == 0 must stay a hard one-hot'
+    assert abs(float(tg[1, 1]) - 0.75) < 1e-6, f'the given label lost too much mass: {tg[1]}'
+    assert abs(float(tg[1, 2]) - 0.25) < 1e-6, f'the teacher pick got the wrong mass: {tg[1]}'
+
+    # ... and refresh() is what decides where the mix goes
+    tk2 = noise.LabelTrustTracker(y.tolist(), C, momentum=0.0, max_noise_frac=1.0,
+                                  relabel_mix=0.4)
+    p2 = torch.full((n, C), 0.05)
+    p2[torch.arange(n), y] = 0.6                     # first half: the teacher agrees
+    p2[n // 2:, :] = 0.02
+    # both indices must be arrays of the same length.  With a slice and an array
+    # in one index tuple PyTorch does NOT pair them up -- it takes the outer
+    # product, writing all nine (row, col) combinations instead of the three
+    # intended ones.  That silently built a different p2 and made this assertion
+    # fail while looking like a tracker bug.
+    rows = torch.arange(n // 2, n)
+    p2[rows, (y[rows] + 1) % C] = 0.9                # second half: confident, wrong
+    # check the fixture before blaming the tracker: the last time this indexing
+    # trap fired, the assertion below failed and the message pointed at
+    # LabelTrustTracker, which was innocent
+    n_disagree = int((p2.max(1).indices != y).sum())
+    assert n_disagree == n // 2, \
+        f'the test fixture is malformed: {n_disagree} rows disagree with their label, want {n // 2}'
+    tk2.update(torch.arange(n), p2)
+    st = tk2.refresh()
+    assert st['relabel'] == n // 2, st
+    assert abs(float(tk2.mix[0])) < 1e-9, 'an agreed sample must carry no teacher mass'
+    assert abs(float(tk2.mix[-1]) - 0.4) < 1e-6, 'relabelled samples must use --relabel-mix'
+    assert abs(float(tk2.weight[0]) - 1.0) < 1e-6 and abs(float(tk2.weight[-1]) - 0.5) < 1e-6, \
+        'the relabel weight changed'
+    print('  targets ok')
+
+
 def check_proto():
     C, D = 5, DIM
     torch.manual_seed(0)
@@ -242,7 +323,11 @@ def check_proto():
     z1 = torch.randn(4, D)
     ph3.update(z1, torch.full((4,), 1), torch.ones(4, dtype=torch.bool))
     new = ph3.proto[1]
-    target = F.normalize(z1.mean(0), dim=-1)
+    # the class mean as ProtoHead.update computes it: normalise each feature
+    # FIRST, then average, then re-normalise.  F.normalize(z1.mean(0)) is a
+    # different direction, and comparing the EMA against it made this assertion
+    # a coin flip on a threshold (0.999) it was never measuring.
+    target = F.normalize(F.normalize(z1, dim=-1).mean(0), dim=-1)
     assert not torch.allclose(new, old), 'prototype did not move'
     assert not torch.allclose(new, target, atol=1e-6), 'prototype jumped instead of EMA'
     assert float(F.cosine_similarity(new, 0.9 * old + 0.1 * target, dim=0)) > 0.999
@@ -250,6 +335,17 @@ def check_proto():
 
 
 def check_lora():
+    # competition rule 五.1: only CLIP ViT-B/32 may be built.  A larger backbone
+    # would train fine and be disqualified, so it has to be refused up front.
+    train.check_backbone('ViT-B-32-quickgelu')
+    for bad in ('ViT-L-14', 'ViT-B-16', 'RN50', 'ViT-H-14'):
+        try:
+            train.check_backbone(bad)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f'{bad} was accepted as a backbone')
+
     torch.manual_seed(0)
     clip = _StubCLIP()
     net = train.Net(clip, 4, lora_rank=4, lora_target='all')
@@ -342,6 +438,17 @@ def check_end_to_end():
         ck = torch.load(out / 'best.pt', map_location='cpu', weights_only=False)
         assert ck['classes'] == {f'{c:04d}': c for c in range(4)}, ck['classes']
         assert ck['epoch'] >= 0
+        # snapshots are inference-only.  The tracker posterior alone is
+        # n_train x n_class floats -- 446 MB per snapshot on the real 148695x750
+        # round -- and inference reads none of it, nor the optimiser or RNG state.
+        assert not ({'tracker', 'optim', 'rng'} & set(ck)), \
+            f'best.pt carries training state only last.pt needs: {sorted(ck)}'
+        assert len(ck['class_counts']) == 4 and sum(ck['class_counts']) == len(tr_paths), \
+            f'class_counts must describe the training split: {ck["class_counts"]}'
+        # ... while last.pt has to stay resumable
+        full = torch.load(out / 'last.pt', map_location='cpu', weights_only=False)
+        for k in ('tracker', 'optim', 'rng'):
+            assert k in full, f'last.pt lost {k}, --resume would break'
 
         csv_path = tmp / 'pred_results.csv'
         infer.main(infer.parse_args(['--test', str(root), '--checkpoint', str(out / 'best.pt'),
@@ -352,6 +459,28 @@ def check_end_to_end():
                    for r in rows), f'bad CSV rows: {rows[:3]}'
         assert len({r[0] for r in rows}) == 32, 'duplicate file names in the CSV'
         print(f'  end-to-end ok ({len(rows)} predictions, sample {rows[0]})')
+
+        # several taus must come out of ONE forward pass, one CSV each
+        infer.main(infer.parse_args(['--test', str(root), '--checkpoint', str(out / 'best.pt'),
+                                     '--output', str(tmp / 'p.csv'),
+                                     '--logit-adjust', '0', '0.5', '1.0']))
+        for f in ('p.csv', 'p_tau050.csv', 'p_tau100.csv'):
+            assert (tmp / f).exists(), f'--logit-adjust did not write {f}'
+        assert infer.adjusted_path('pred_results.csv', 0) == 'pred_results.csv'
+        assert infer.adjusted_path('pred_results.csv', 1.0) == 'pred_results_tau100.csv'
+        print('  logit-adjust ok')
+
+        # the error-analysis report must survive a model whose confusion
+        # structure is whatever the stub happens to produce (including none)
+        adir = tmp / 'analysis'
+        analyze.report(analyze.parse_args(['--data', str(root), '--checkpoint', str(out / 'best.pt'),
+                                           '--out', str(adir), '--workers', '0', '--split', 'val',
+                                           '--val-ratio', '0.25', '--seed', '0']))
+        for f in ('per_class.csv', 'confusions.csv', 'per_sample.csv', 'suspected_noisy.csv'):
+            assert (adir / f).exists(), f'analyze.py did not write {f}'
+        assert len(list(csv.reader((adir / 'per_sample.csv').open()))) == 9, \
+            'per_sample.csv should hold a header + the 8 hold-out images'
+        print('  analyze ok')
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -362,6 +491,7 @@ if __name__ == '__main__':
     print('running self-test...')
     check_losses()
     check_tracker()
+    check_targets()
     check_proto()
     check_lora()
     check_end_to_end()
