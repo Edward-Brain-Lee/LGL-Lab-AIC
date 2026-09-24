@@ -44,7 +44,7 @@ from torchvision import transforms
 import open_clip
 
 from losses import ce as xent, make_robust_loss
-from noise import LabelTrustTracker, prototype_bootstrap
+from noise import FrozenJudge, LabelTrustTracker, prototype_bootstrap
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -65,6 +65,187 @@ def check_backbone(name):
         raise SystemExit(
             f'backbone {name!r} is not allowed. The competition requires CLIP ViT-B/32 '
             f'(allowed open_clip names: {sorted(ALLOWED_BACKBONES)}).')
+
+
+#: short-side ratio of the eval transform.  224 -> 256 is the CLIP convention
+#: (``Resize(256), CenterCrop(224)``); keeping the ratio fixed as the crop size
+#: grows is what makes 288/320 a fair comparison against 224.
+RESIZE_RATIO = 256 / 224
+
+
+def patch_grid(clip_model, size):
+    """``(patch, n, clean)`` for a ``size``-pixel input.
+
+    ``clean`` is False when the size is not a whole number of patches.  This
+    matters for the resolution ladder: ViT-B/32 has **32px** patches, so 224 /
+    256 / 288 / 320 / 352 / 384 are clean and **336 is not** (336/32 = 10.5).
+    336 is the usual CLIP figure, but it comes from ViT-L/14@336 where
+    336/14 = 24 exactly -- copying it onto a patch-32 tower does not mean what
+    it means there.
+
+    The consequence is exact, and it is worth being precise about because the
+    failure is silent rather than an error.  In open_clip (checked against the
+    vendored ``_oc_src/``, 3.x):
+
+    * ``transformer.PatchEmbed.__init__`` sets ``grid_size = image_size // patch``
+      (floor division), so a forced 336 gives a 10x10 position-embedding grid;
+    * ``model.resize_pos_embed`` early-returns when the sequence length already
+      matches, else bicubic+antialias interpolates onto that grid;
+    * the patch convolution itself can only produce ``(size - patch) // patch + 1``
+      tokens, which for 336 is also 10.
+
+    So 336 loads and runs fine -- it is *the same 10x10 model as 320*, fed a
+    336px crop whose outer 16px no patch ever reads.  Strictly dominated by 320.
+    """
+    ps = None
+    pe = getattr(getattr(clip_model, 'visual', None), 'patch_embed', None)
+    for cand in (getattr(pe, 'patch_size', None),
+                 getattr(getattr(pe, 'proj', None), 'kernel_size', None)):
+        if cand is not None:
+            ps = int(cand[0]) if isinstance(cand, (tuple, list)) else int(cand)
+            break
+    if not ps:                          # unknown tower -- fall back to its stem conv
+        for m in clip_model.modules():
+            if isinstance(m, nn.Conv2d) and m.stride[0] > 1:
+                ps = int(m.kernel_size[0])
+                break
+    if not ps:
+        return None, None, True         # cannot tell; never cry wolf
+    size = int(size)
+    n = (size - ps) // ps + 1           # what the patch convolution really produces
+    return ps, n, (size % ps == 0 and n == size // ps)
+
+
+def build_clip(name, pretrained='openai', image_size=224):
+    """Create the CLIP visual tower at ``image_size``.
+
+    ``force_image_size`` makes open_clip resample the *positional embeddings*
+    onto the new patch grid while loading the pretrained weights (bicubic +
+    antialias, ``resample_abs_pos_embed``).  ViT-B/32 tolerates this because its
+    patch embedding is a stride-32 convolution that does not care about the
+    input size.  Architecture and weights are unchanged -- the competition
+    explicitly permits this, see README_AUTODL.md 5.
+
+    224 is special-cased to *not* pass the flag, so the default path stays
+    bit-identical to the runs whose leaderboard scores we compare against
+    (resampling a 7x7 grid onto itself is not guaranteed to be a no-op).
+    Passing an unsupported ``force_image_size`` raises rather than being
+    ignored: a silently-ignored resolution would mean training at 224 while
+    believing 320, and nothing downstream would notice.
+
+    Prefer a multiple of the patch size (32 for ViT-B/32) -- see
+    ``patch_grid``; a size like 336 is warned about rather than accepted
+    silently.
+    """
+    check_backbone(name)
+    size = int(image_size)
+    kw = {} if size == 224 else {'force_image_size': size}
+    model = open_clip.create_model(name, pretrained=pretrained, **kw)
+    if size != 224:
+        ps, n, clean = patch_grid(model, size)
+        if not clean:
+            print(f'WARNING: --image-size {size} is not a whole number of {ps}px patches '
+                  f'({size / ps:g}); the patch convolution produces a {n}x{n} grid, so this '
+                  f'behaves like {n * ps}px with a {size - n * ps}px margin that no patch '
+                  f'ever sees. Use a multiple of {ps} (224/256/288/320/352/384).')
+    return model
+
+
+#: the view geometries ``eval_transform(crop=...)`` can produce
+CROP_POLICIES = ('center', 'full', 'pad')
+
+
+class PadToSquare:
+    """Scale the *long* side to ``size``, then pad the short side to a square.
+
+    ``Resize(size)`` alone would leave a non-square tensor, and the vision tower
+    was built for a ``size`` x ``size`` patch grid, so the square has to be
+    restored.  Padding with the CLIP mean colour keeps the border away from
+    anything the normalisation will amplify.
+    """
+
+    def __init__(self, size, fill=CLIP_MEAN):
+        self.size = int(size)
+        self.fill = tuple(int(round(255 * c)) for c in fill)
+
+    def __call__(self, img):
+        w, h = img.size
+        s = self.size / max(w, h)
+        img = img.resize((max(1, round(w * s)), max(1, round(h * s))), Image.BICUBIC)
+        w, h = img.size
+        out = Image.new('RGB', (self.size, self.size), self.fill)
+        out.paste(img, ((self.size - w) // 2, (self.size - h) // 2))
+        return out
+
+
+def eval_transform(size=224, flip=False, *, crop='center'):
+    """Eval-time preprocessing.  One definition, shared by everything.
+
+    Used by ``train.py`` (hold-out val), ``infer.py``, ``valmetrics.py``,
+    ``analyze.py`` and ``probe.py``.  A mismatch between any two of them is
+    invisible and silently costs accuracy; the only symptom is that a
+    checkpoint's logged ``val_acc`` stops reproducing (see the self-check in
+    ``valmetrics.py``).
+
+    ``crop`` selects how much of the image survives:
+
+    ``'center'``
+        Resize the short side to ``size*256/224``, centre crop.  The CLIP and
+        ImageNet convention, and what every run up to 2026-09-24 used.
+    ``'full'``
+        Squash the whole image to ``size`` x ``size``: nothing is cropped, but
+        the aspect ratio is distorted.
+    ``'pad'``
+        Scale the long side to ``size`` and pad the rest: nothing is cropped
+        *and* the aspect ratio is kept, at the cost of lowering the effective
+        resolution along the short side.
+
+    Why this axis exists: the centre crop is not free.  Measured on the
+    geometries this dataset actually contains (the resized size is what
+    ``Resize(size*256/224)`` actually produces -- 341, not 341.33) ::
+
+        480x640 (3:4)    -> 256x341  keeps 57.5%   87.5% wide, 65.7% high
+        480x720 (2:3)    -> 256x384  keeps 51.0%   87.5% wide, 58.3% high
+        480x480 (square) -> 256x256  keeps 76.6%   87.5% wide, 87.5% high
+
+    The last row is the point that has nothing to do with aspect ratio:
+    ``Resize`` followed by ``CenterCrop`` discards the outer 1/8 of *both* axes
+    whatever the shape, so 23.4% of the frame is gone even from a square image.
+    For a fine-grained task, where the discriminative part (a bill, a petal, a
+    stamen) is small and often off-centre, that is the part that may be
+    deciding.  On a 2:3 portrait nearly half the frame never reaches the model.
+
+    All three policies stay inside the trained patch grid, so unlike a
+    resolution change this needs no positional-embedding interpolation.  That is
+    *not* the same as "no risk", though -- they differ in apparent object size,
+    the quantity FixRes (Touvron et al. 2019) says must match between train and
+    test.  Relative to ``full`` = 1.000, on a 3:4 image::
+
+        training RRC(scale=(crop_min,1))   [1.000, 1.348], mean 1.148
+        'center'                            1.320
+        'full'                              1.000
+        'pad'                               0.866
+
+    So ``full`` and ``pad`` present objects *smaller* than the training mean --
+    exactly the mismatch FixRes warns about -- while ``center`` presents them
+    larger.  Neither is neutral, and the two effects (this one, and the frame
+    content ``center`` discards) push in opposite directions.  Which wins is a
+    measurement, not an argument -- ``probe.py --tta`` scores them on val.
+    """
+    if crop not in CROP_POLICIES:
+        raise ValueError(f'crop={crop!r}, expected one of {CROP_POLICIES}')
+    size = int(size)
+    if crop == 'center':
+        ops = [transforms.Resize(max(1, int(round(size * RESIZE_RATIO)))),
+               transforms.CenterCrop(size)]
+    elif crop == 'full':
+        ops = [transforms.Resize((size, size))]
+    else:
+        ops = [PadToSquare(size)]
+    if flip:                            # test-time augmentation, p=1.0
+        ops.append(transforms.RandomHorizontalFlip(p=1.0))
+    ops += [transforms.ToTensor(), transforms.Normalize(CLIP_MEAN, CLIP_STD)]
+    return transforms.Compose(ops)
 
 
 def smooth_target(t, smooth, nclass):
@@ -99,7 +280,15 @@ def seed_everything(seed=3407, deterministic=True):
 
 def seed_worker(worker_id):
     """Seed the python/numpy RNG of every dataloader worker (torch is seeded by
-    DataLoader itself from the loader's generator)."""
+    DataLoader itself from the loader's generator).
+
+    **This is no longer what makes the augmentation reproducible.**  That is done
+    per item in ``ImageFolderNoisy.augmented``, which derives its randomness from
+    ``(seed, index, view)`` rather than from the worker's RNG -- seeding the
+    worker only makes the run repeatable *on one machine with one ``--workers``*.
+    Kept because anything else that draws randomness in a worker should still
+    start from a defined state.
+    """
     s = torch.initial_seed() % 2 ** 32
     random.seed(s)
     try:
@@ -203,6 +392,127 @@ class CosineClassifier(nn.Module):
         return self.logit_scale.exp().clamp(1, 100) * F.linear(F.normalize(x), F.normalize(self.weight))
 
 
+def param_groups(model, weight_decay):
+    """AdamW parameter groups: everything decayed **except the temperature**.
+
+    ``head.logit_scale`` must not be weight-decayed.  Whenever the tracker
+    decides anything it compares a *probability* against an absolute threshold
+    (``--tau-conf 0.8``), so shrinking the temperature regularises nothing --
+    it flattens every posterior and moves the clean/noisy boundary to wherever
+    the decay has pushed the scale.  A scalar that is supposed to be learned
+    *upwards* is not something to decay towards zero.
+
+    The visual tower's own CLIP ``logit_scale`` is frozen by ``Net.__init__``,
+    so at most one scalar ends up in the no-decay group; the assert fires if the
+    naming ever changes, because the symptom of getting this wrong is a silent
+    accuracy loss rather than an error.
+    """
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        (no_decay if name.endswith('logit_scale') else decay).append(p)
+    assert no_decay, 'no trainable logit_scale found -- did CosineClassifier get renamed?'
+    return [{'params': decay, 'weight_decay': weight_decay},
+            {'params': no_decay, 'weight_decay': 0.0}]
+
+
+#: LR at the start of the linear warm-up, as a fraction of ``--lr``.
+LR_WARMUP_START = 0.1
+
+
+def lr_factor(step, total, warm, start=LR_WARMUP_START):
+    """The LR multiplier of epoch ``step``, as a pure function.
+
+    Split out from the scheduler so the *shape* can be checked without torch
+    (``selftest`` checks the wiring; this arithmetic is what a wrong warm-up
+    would silently get wrong).
+
+    ``warm == 0`` reproduces torch's ``CosineAnnealingLR`` exactly:
+    ``(1 + cos(pi * step / total)) / 2``, which is that class's closed form.
+
+    ``step`` is clamped below at 0.  ``last_epoch`` is ``-1`` until the first
+    ``step()``, and the warm-up branch extrapolates linearly -- so an
+    unclamped ``-1`` yields ``start - (1-start)/warm``, a **negative** learning
+    rate that would move the weights the wrong way.  It does not happen on the
+    normal path, where ``_initial_step`` bumps ``last_epoch`` to 0 before
+    ``get_lr`` is ever called, which is exactly why it would have been an
+    unpleasant thing to discover later.
+    """
+    step = max(0.0, float(step))
+    if warm > 0 and step < warm:
+        return start + (1.0 - start) * step / warm
+    if total <= warm:
+        return 1.0
+    # p in [0, 1] across the annealing part; the upper clamp keeps a step past
+    # the end (--resume with a changed --epochs) at the floor instead of
+    # climbing back up the far side of the cosine
+    p = min(1.0, max(0.0, (step - warm) / (total - warm)))
+    return 0.5 * (1.0 + math.cos(math.pi * p))
+
+
+#: torch renamed ``_LRScheduler`` to ``LRScheduler`` in 2.0; both names exist in
+#: 2.x, only the old one in 1.x, so take whichever is there.
+_LRSchedulerBase = getattr(torch.optim.lr_scheduler, 'LRScheduler',
+                           torch.optim.lr_scheduler._LRScheduler)
+
+
+class WarmupCosineLR(_LRSchedulerBase):
+    """Cosine decay reached through a linear warm-up (D6).
+
+    ``CosineAnnealingLR`` hands out the peak LR on the very first epoch, and at
+    that moment ``head.weight`` is random: a 750-way cosine head is asked to find
+    its scale *and* its 750 directions from a cold start, at the largest step
+    size it will ever see, against labels a sixth of which are wrong.  That is
+    the worst-conditioned part of the run.
+
+    Written as a plain ``LRScheduler`` subclass rather than ``SequentialLR`` over
+    ``LinearLR`` + ``CosineAnnealingLR`` for two reasons: the shape is then our
+    arithmetic instead of an interaction between two library schedulers that
+    differs between torch versions, and ``state_dict`` round-trips (``SequentialLR``
+    nests its children, and ``LambdaLR`` blanks out its lambdas -- either would
+    make ``--resume`` subtly wrong or crash).
+
+    ``--lr-warmup-epochs 0`` reproduces the old schedule exactly, so runs started
+    before this existed stay reproducible.
+    """
+
+    def __init__(self, optimizer, total, warm, start=LR_WARMUP_START, last_epoch=-1):
+        self.total, self.warm, self.start = int(total), int(warm), float(start)
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        f = lr_factor(self.last_epoch, self.total, self.warm, self.start)
+        return [base_lr * f for base_lr in self.base_lrs]
+
+
+def make_scheduler(opt, a):
+    """The LR schedule for a run described by ``a``.
+
+    The warm-up is counted in epochs, to match ``--epochs``; the cosine then
+    anneals over whatever is left.  The warm-up is capped at ``epochs - 1`` so
+    that a short run still has somewhere to anneal to.
+    """
+    warm_ep = max(0, min(int(a.lr_warmup_epochs), int(a.epochs) - 1))
+    return WarmupCosineLR(opt, a.epochs, warm_ep)
+
+
+def load_sched(sched, sd):
+    """Restore an LR schedule, or say why not.
+
+    Adding the warm-up changed the schedule's structure, so a checkpoint written
+    before it cannot be resumed into it.  That is a genuine situation -- a run
+    started on the old code and continued on the new one restarts its warm-up --
+    so it is reported rather than crashing.
+    """
+    try:
+        sched.load_state_dict(sd)
+    except Exception as e:                  # any structure mismatch, of any flavour
+        print(f'WARNING: LR schedule not restored ({type(e).__name__}: {e}); it restarts '
+              f'from --lr-warmup-epochs. Normal when resuming a checkpoint written before '
+              f'the LR warm-up existed.')
+
+
 class ProtoHead(nn.Module):
     """EMA class prototypes used as a contrastive target (MoPro / Sel-CL).
 
@@ -302,8 +612,10 @@ class ImageFolderNoisy(Dataset):
     list and is what the noise tracker and prototype bootstrap are keyed on.
     """
 
-    def __init__(self, root, transform, val=False, val_ratio=0.1, seed=3407, split='train'):
+    def __init__(self, root, transform, val=False, val_ratio=0.1, seed=3407, split='train',
+                 stochastic=False):
         self.root, self.transform, self.split = Path(root), transform, split
+        self.seed, self.stochastic = int(seed), bool(stochastic)
         classes = sorted([p.name for p in self.root.iterdir() if p.is_dir()])
         self.class_to_idx = {c: i for i, c in enumerate(classes)}
         items = []
@@ -333,9 +645,47 @@ class ImageFolderNoisy(Dataset):
         except Exception:                       # truncated / unreadable file
             return Image.new('RGB', (224, 224), (127, 127, 127))
 
+    def augmented(self, img, i, view=0):
+        """Apply the training transform with randomness derived from ``(seed, i, view)``.
+
+        Why not just let the transform draw from the worker's RNG: because then
+        the augmentation of item ``i`` depends on *which worker* happened to draw
+        it, and that mapping changes with ``--workers``.  The competition requires
+        the submitted code to be able to reproduce the result, so a recipe whose
+        output silently depends on a loader flag is a reproducibility hole -- and
+        the failure is invisible, because every ``--workers`` setting still runs
+        and still converges, just to a different point.
+
+        Seeding per item makes the augmentation a pure function of
+        ``(seed, index, view)``, so it is identical for any ``--workers``.
+        ``fork_rng`` restores torch's global state on exit; python's ``random``
+        module has to be saved by hand.
+
+        Cost is a few microseconds per image against a RandAugment that is
+        already milliseconds, so it does not show up in throughput.
+        """
+        if not self.stochastic:
+            return self.transform(img)
+        # A spread-out mix so that adjacent indices and the two views do not get
+        # correlated seeds.  The modulus is 2**63-1 (the int64 max, which is what
+        # torch.manual_seed takes): at 2**31-1 a 149k-image set has ~20 birthday
+        # collisions between two items' seeds, which is harmless -- the images
+        # differ, so only the augmentation *parameters* coincide -- but there is
+        # no reason to accept it when the wider space makes it ~0.
+        h = ((self.seed * 0x9E3779B1) ^ (int(i) * 0x85EBCA77) ^ (int(view) * 0xC2B2AE3D))
+        s = (h ^ (h >> 15)) % (2 ** 63 - 1)
+        py_state = random.getstate()
+        try:
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(s)
+                random.seed(s)
+                return self.transform(img)
+        finally:
+            random.setstate(py_state)
+
     def __getitem__(self, i):
         path, y = self.items[i]
-        return self.transform(self._load(path)), y, i
+        return self.augmented(self._load(path), i, 0), y, i
 
 
 class TwoView(Dataset):
@@ -350,20 +700,22 @@ class TwoView(Dataset):
     def __getitem__(self, i):
         path, y = self.base.items[i]
         img = self.base._load(path)
-        return self.base.transform(img), self.base.transform(img), y, i
+        # view 0 and view 1 get different seeds, so the two views are independent
+        # *and* each is reproducible on its own (see ImageFolderNoisy.augmented)
+        return self.base.augmented(img, i, 0), self.base.augmented(img, i, 1), y, i
 
 
 def build_datasets(a):
     train_tf = transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(a.crop_min, 1.0)),
+        transforms.RandomResizedCrop(a.image_size, scale=(a.crop_min, 1.0)),
         transforms.RandomHorizontalFlip(),
         transforms.RandAugment(a.randaug_n, a.randaug_m),
         transforms.ToTensor(),
         transforms.Normalize(CLIP_MEAN, CLIP_STD)])
-    val_tf = transforms.Compose([
-        transforms.Resize(256), transforms.CenterCrop(224),
-        transforms.ToTensor(), transforms.Normalize(CLIP_MEAN, CLIP_STD)])
-    tr = ImageFolderNoisy(a.data, train_tf, False, a.val_ratio, a.seed, 'train')
+    val_tf = eval_transform(a.image_size)
+    # stochastic=True only on the training split: the eval transform is
+    # deterministic, so forking the RNG per image there would be pure overhead
+    tr = ImageFolderNoisy(a.data, train_tf, False, a.val_ratio, a.seed, 'train', stochastic=True)
     va = ImageFolderNoisy(a.data, val_tf, True, a.val_ratio, a.seed, 'val')
     assert len(tr) > 0, f'no images found under {a.data}'
     return tr, va
@@ -458,7 +810,7 @@ def main(a):
     print(f'classes={nclass} train={len(tr)} val={len(va)} device={device} amp={a.amp}')
     print('config: ' + ' '.join(f'{k}={v}' for k, v in sorted(vars(a).items())))
 
-    clip_model = open_clip.create_model(a.model, pretrained=a.pretrained)
+    clip_model = build_clip(a.model, a.pretrained, a.image_size)
     model = Net(clip_model, nclass, a.lora_rank, a.lora_target,
                 a.proto_momentum, a.proto_temp).to(device)
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -471,6 +823,10 @@ def main(a):
     # ---- frozen-CLIP class means for prototype bootstrap (filled during warm-up)
     boot_sum = torch.zeros(nclass, model.head.weight.shape[-1], device=device)
     boot_cnt = torch.zeros(nclass, device=device)
+    # The judge keeps one frozen feature per training sample (n x 512 fp32, so
+    # ~0.3 GB on the 148k round).  Allocated only when it will be used.
+    judge = (FrozenJudge(len(tr), model.head.weight.shape[-1], a.judge_margin, device)
+             if a.noise_judge else None)
 
     tracker = LabelTrustTracker(tr.targets, nclass, momentum=a.noise_momentum,
                                 tau_conf=a.tau_conf, w_noise=a.w_noise,
@@ -478,9 +834,8 @@ def main(a):
                                 relabel_mix=a.relabel_mix, device=device)
     robust = make_robust_loss(a.robust_loss, a.gce_q, a.apl_k, a.apl_b, a.apl_rce)
 
-    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
-                            lr=a.lr, weight_decay=a.weight_decay)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.epochs)
+    opt = torch.optim.AdamW(param_groups(model, a.weight_decay), lr=a.lr)
+    sched = make_scheduler(opt, a)
     use_amp = a.amp != 'none' and device.type == 'cuda'
     amp_dtype = {'bf16': torch.bfloat16, 'fp16': torch.float16}.get(a.amp)
     try:                                    # torch >= 2.3 API, older one as a fallback
@@ -500,7 +855,7 @@ def main(a):
         for p in teacher.parameters():
             p.requires_grad = False
         opt.load_state_dict(ck['optim'])
-        sched.load_state_dict(ck['sched'])
+        load_sched(sched, ck['sched'])
         tracker.load_state_dict(ck['tracker'])
         torch.set_rng_state(ck['rng']['torch'])
         if ck['rng'].get('cuda') is not None:
@@ -550,7 +905,7 @@ def main(a):
             idx_g = idx.to(device, non_blocking=True)
             bsz = y.numel()
 
-            need_anchor = a.anchor_weight > 0 or (warm and a.proto_weight > 0)
+            need_anchor = a.anchor_weight > 0 or (warm and (a.proto_weight > 0 or judge is not None))
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
                 anchor = model.anchor_feat(x1) if need_anchor else None   # frozen CLIP, LoRA off
@@ -612,9 +967,11 @@ def main(a):
                     if sp.requires_grad:
                         tp.mul_(a.ema).add_(sp, alpha=1 - a.ema)
 
-                if warm and a.proto_weight > 0:
+                if warm and anchor is not None:
                     boot_sum.index_add_(0, y, anchor)       # frozen-CLIP class means
                     boot_cnt.index_add_(0, y, torch.ones(bsz, device=device))
+                    if judge is not None:
+                        judge.add(idx_g, anchor)
                 if a.proto_weight > 0 and not warm:
                     # the prototype EMA still needs a hard assignment: averaging
                     # features under a soft target would let a confused sample
@@ -624,10 +981,32 @@ def main(a):
             running += loss.item() * bsz
             seen += bsz
 
-        if warm and ep + 1 == a.warmup_epochs and a.proto_weight > 0:
-            means, present = prototype_bootstrap(boot_sum, boot_cnt)
-            model.proto.init_from_means(means, present)
-            print(f'prototypes seeded from frozen CLIP for {int(present.sum())}/{nclass} classes')
+        if warm and ep + 1 == a.warmup_epochs:
+            if a.proto_weight > 0 or judge is not None:
+                means, present = prototype_bootstrap(boot_sum, boot_cnt)
+                print(f'frozen-CLIP class means built for {int(present.sum())}/{nclass} classes')
+                if a.proto_weight > 0:
+                    model.proto.init_from_means(means, present)
+                if judge is not None:
+                    suspect, _jpred, _jmargin = judge.judge(means, tracker.y, present)
+                    tracker.set_judge(suspect)
+                    n_seen = int(judge.seen.sum())
+                    print(f'frozen-CLIP judge: {int(suspect.sum())}/{n_seen} of the samples seen '
+                          f'during warm-up are suspect (another class centroid is closer by more '
+                          f'than {a.judge_margin:g}). A veto demotes the weight; it never changes '
+                          f'the label or the target.')
+                    if n_seen < len(tr):
+                        print(f'  note: {len(tr) - n_seen} samples were never drawn during '
+                              f'warm-up and are not judged (the sampler has no reason to draw '
+                              f'them later either, so they keep the given label at weight 1)')
+            # The posterior EMA was accumulated against a *randomly initialised*
+            # head, and a sample's first observation is stored verbatim rather
+            # than averaged away, so that noise survives into every later epoch.
+            # Restart it: the next batch's posterior becomes the first
+            # observation, from a teacher that has actually been trained.
+            tracker.reset()
+            print('tracker posterior reset at the end of warm-up (prob/seen cleared); the next '
+                  'epoch runs with every sample unseen, i.e. unfiltered, while it refills')
 
         sched.step()
         vl, va_acc, va_hi = evaluate(model, vloader, device, amp_dtype, use_amp)
@@ -676,12 +1055,27 @@ def parse_args(argv=None):
     p.add_argument('--batch-size', type=int, default=128)
     p.add_argument('--workers', type=int, default=8)
     p.add_argument('--lr', type=float, default=2e-4)
+    p.add_argument('--lr-warmup-epochs', type=int, default=1, dest='lr_warmup_epochs',
+                   help='linear LR warm-up from --lr * %g up to --lr over this many epochs, '
+                        'then cosine decay over the rest. Default 1: the cosine head is '
+                        'randomly initialised but CosineAnnealingLR starts at peak LR. '
+                        '0 restores the old schedule exactly.' % LR_WARMUP_START)
     p.add_argument('--weight-decay', type=float, default=0.05)
     p.add_argument('--seed', type=int, default=3407)
     p.add_argument('--cudnn-benchmark', action='store_true',
                    help='faster but not bit-reproducible (default: off)')
     p.add_argument('--amp', default='bf16', choices=['bf16', 'fp16', 'none'])
     p.add_argument('--val-ratio', type=float, default=0.1)
+    p.add_argument('--image-size', type=int, default=224,
+                   help='input resolution. 224 = the pretrained/CLIP default and '
+                        'the only size that reproduces the earlier runs bit-for-bit; '
+                        'anything else resamples the positional embeddings '
+                        '(competition-permitted, see README_AUTODL.md 5). Recorded '
+                        'in the checkpoint, and read back by infer/valmetrics/'
+                        'analyze, so a mismatch cannot go unnoticed. Use a multiple '
+                        'of the 32px patch size: 256/288/320/352/384 -- NOT 336, '
+                        'which is a patch-14 number (336/14=24) with no meaning for '
+                        'ViT-B/32.')
     p.add_argument('--limit-batches', type=int, default=0, help='smoke test: stop after N steps')
     p.add_argument('--sampler', default='balanced', choices=['balanced', 'uniform'])
     p.add_argument('--select', default='val_acc', choices=['val_acc', 'val_acc_hi'])
@@ -704,6 +1098,19 @@ def parse_args(argv=None):
     p.add_argument('--apl-k', type=float, default=0.2)
     p.add_argument('--apl-b', type=float, default=1.0)
     p.add_argument('--apl-rce', type=float, default=1.0)
+
+    p.add_argument('--noise-judge', action='store_true', dest='noise_judge',
+                   help='veto the rule "the teacher agrees, so this label is clean" '
+                        'with an independent frozen-CLIP NCC judgement. Without it, a '
+                        'sample the student has memorised -- including a wrong label -- agrees '
+                        'with itself forever and keeps full weight. Costs one frozen feature '
+                        'per training sample (~0.3GB at 148k x 512). The veto only demotes the '
+                        'weight; it never relabels. Measure its false-positive rate with '
+                        'probe.py before trusting it.')
+    p.add_argument('--judge-margin', type=float, default=0.02, dest='judge_margin',
+                   help='how much closer another class centroid must be, in cosine, before the '
+                        'judge calls a sample suspect. 0 vetoes on a bare tie; higher is more '
+                        'conservative. probe.py reports the distribution to choose from.')
 
     p.add_argument('--noise-momentum', type=float, default=0.9)
     p.add_argument('--tau-conf', type=float, default=0.8,

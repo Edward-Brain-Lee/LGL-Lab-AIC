@@ -39,11 +39,8 @@ import argparse
 
 import torch
 from torch.utils.data import DataLoader
-from torchvision import transforms
 
-import open_clip
-
-from train import CLIP_MEAN, CLIP_STD, ImageFolderNoisy, Net, check_backbone
+from train import ImageFolderNoisy, Net, build_clip, eval_transform
 
 
 @torch.no_grad()
@@ -71,11 +68,8 @@ def report(path, ck, model, device, a):
     ck_args = ck.get('args', {})
     data = a.data or ck_args.get('data')
     assert data, 'checkpoint has no --data recorded; pass --data explicitly'
-    val_tf = transforms.Compose([
-        transforms.Resize(256), transforms.CenterCrop(224),
-        transforms.ToTensor(), transforms.Normalize(CLIP_MEAN, CLIP_STD)])
-    va = ImageFolderNoisy(data, val_tf, True, ck_args.get('val_ratio', 0.1),
-                          ck_args.get('seed', 3407), 'val')
+    va = ImageFolderNoisy(data, eval_transform(ck_args.get('image_size', 224)), True,
+                          ck_args.get('val_ratio', 0.1), ck_args.get('seed', 3407), 'val')
     assert va.class_to_idx == ck['classes'], (
         'val split found a different class list than the checkpoint -- '
         'wrong --data?')
@@ -104,10 +98,11 @@ def main(a):
         rank = ck.get('lora_rank', ck_args.get('lora_rank', 8))
         target = ck.get('lora_target', ck_args.get('lora_target', 'all'))
         model_name = ck.get('model_name', ck_args.get('model', 'ViT-B-32-quickgelu'))
-        check_backbone(model_name)
 
-        clip_model = open_clip.create_model(model_name,
-                                            pretrained=ck.get('pretrained', 'openai'))
+        # Same size as the run that produced the checkpoint, otherwise the
+        # val_acc self-check below compares two different forward passes.
+        clip_model = build_clip(model_name, ck.get('pretrained', 'openai'),
+                                ck_args.get('image_size', 224))
         model = Net(clip_model, len(ck['classes']), rank, target)
         missing, _ = model.load_state_dict(ck.get('model', ck), strict=False)
         lost = {n for n, p in model.named_parameters() if p.requires_grad} & set(missing)

@@ -52,10 +52,9 @@ def build_split(a, split):
     Membership depends only on ``(seed, val_ratio, val=...)``; the transform is
     passed here as the deterministic evaluation one so the numbers are stable.
     """
-    val_tf = transforms.Compose([
-        transforms.Resize(256), transforms.CenterCrop(224),
-        transforms.ToTensor(), transforms.Normalize(T.CLIP_MEAN, T.CLIP_STD)])
-    return T.ImageFolderNoisy(a.data, val_tf, val=(split == 'val'),
+    # a.image_size is resolved from the checkpoint by load_model(), which
+    # report() calls first -- so a 336 checkpoint is analysed at 336.
+    return T.ImageFolderNoisy(a.data, T.eval_transform(a.image_size), val=(split == 'val'),
                               val_ratio=a.val_ratio, seed=a.seed, split=split)
 
 
@@ -68,8 +67,11 @@ def load_model(a, device):
     pretrained = a.pretrained or ck.get('pretrained', 'openai')
     model_name = ck.get('model_name', ck_args.get('model', 'ViT-B-32-quickgelu'))
     T.check_backbone(model_name)
+    # resolve once, here, so build_split() and the model agree (--image-size 0
+    # means "as the checkpoint was trained")
+    a.image_size = getattr(a, 'image_size', 0) or ck_args.get('image_size', 224)
 
-    clip_model = open_clip.create_model(model_name, pretrained=pretrained)
+    clip_model = T.build_clip(model_name, pretrained, a.image_size)
     model = T.Net(clip_model, len(classes), rank, target)
     missing, _ = model.load_state_dict(ck.get('model', ck), strict=False)
     trained = {n for n, p in model.named_parameters() if p.requires_grad}
@@ -230,6 +232,9 @@ def parse_args(argv=None):
     p.add_argument('--workers', type=int, default=8)
     p.add_argument('--pretrained', default='', help='override (default: as in the checkpoint)')
     p.add_argument('--lora-rank', type=int, default=0, help='override (default: as in the checkpoint)')
+    p.add_argument('--image-size', type=int, default=0,
+                   help='input resolution; 0 = as in the checkpoint (required to match, '
+                        'otherwise this analyses a different forward pass than was trained)')
     return p.parse_args(argv)
 
 
