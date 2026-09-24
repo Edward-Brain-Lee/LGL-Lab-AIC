@@ -13,7 +13,7 @@
 | `analyze.py` | 训练后的错误分析报告（哪些类坏了、混淆是不是单向的）。`selftest.py` 会 import 它 |
 | `selftest.py` | **先跑这个**：10 秒自检，不需要数据 / GPU / CLIP 权重 |
 | `valmetrics.py` | 对**已有 checkpoint** 算 micro / macro 准确率并排对比，零训练成本。用来判断"排行榜分数比 `val_acc` 低"是不是度量口径造成的。**脚本会自检：`val_acc` 必须等于训练日志里的值** |
-| `perclass.py` | 对**已有 checkpoint** 打召回率分布直方图 + 每个坏类被误判成了什么。诊断"哪些类卡死了" |
+| `probe_resolution.py` | **换分辨率前先跑这个**：问 open_clip「换尺寸会不会自动插值」「插值后特征还对得上吗」。只读，约 10 秒。**需要 GPU 模式**（加载模型就要 1.3GB，无卡模式 2GB 会被 OOM 杀掉） |
 
 ## 1. 方法
 
@@ -140,6 +140,34 @@ zip submission.zip pred_results.csv
 > **每个 tau 都是一份合法提交**，可以分别上排行榜试。它只在"训练集不均衡、测试集均衡"时才有用——
 > 复赛训练集实测近乎均衡（见 HANDOFF §14.1），所以**预期收益很小**，当 tie-breaker 用就好。
 
+**Step 7b ⭐ TTA —— 目前唯一实测有效的提分手段（+2.09 点）**
+
+```bash
+python infer.py --test /root/autodl-tmp/test --checkpoint outputs_ema/ep20.pt \
+  --output sub_tta4.csv --tta plain flip wide tight
+```
+
+**单模型、同一份权重、多次确定性的前向，logits 平均后再 argmax** —— 不是集成
+（规则五.4 禁的是**多模型**，`selftest.py` 里有断言守着"不加 `--tta` 就是逐字节的旧行为"）。
+
+| 视图 | 变换 | 覆盖 |
+| --- | --- | --- |
+| `plain` | `Resize(256)+CenterCrop(224)` | 短边 **87.5%**（= 训练/验证用的取景框） |
+| `flip` | 同上 + 水平翻转 | 同上 |
+| `wide` | `Resize(224)+CenterCrop(224)` | **整幅画面**（= open_clip 官方预处理） |
+| `tight` | `Resize(320)+CenterCrop(224)` | 短边 **70%**，单目标像素更多 |
+
+- **不写 `--tta`** ⇒ `['plain']`，与改动前逐字节相同
+- **裸 `--tta`** ⇒ `plain flip`
+- 视图由**比例**定义，自动跟着 `--img-size` 缩放
+- 可与 `--logit-adjust` 组合，一次前向出多个 tau 文件
+
+**实测：4 视图平均 = 66.2456，无 TTA = 64.16 ⇒ +2.09。**
+
+> ⚠️ **单个 `wide` 视图单独用会掉分**（实测 62，比 64.16 低 2.16）—— 模型是在 `plain` 取景框上
+> 训练的，单独换 framing 就是训练/测试失配。**收益来自多视图平均，不是来自"修正取景框"。**
+> ⇒ 别把单个坏视图的分数当结论；**也不要**为此去改训练时的预处理重训。
+
 ## 3. 常用参数
 
 | 参数 | 默认 | 说明 |
@@ -160,6 +188,8 @@ zip submission.zip pred_results.csv
 | `--val-ratio` | 0.1 | 验证集比例；定稿冲分时可降到 0.05 |
 | `--select` | val_acc | 选最佳权重依据，可换 `val_acc_hi` |
 | `--save-every` | 4 | 每 N 轮额外存一个 `epN.pt`（0 = 只留 best/last）。**这是拿真实排行榜选轮次的唯一手段**，见下文 |
+| `--save-teacher` | **关** | 每轮多评估一次 EMA 教师并存 `teacher_epN.pt` / `teacher_last.pt`。**不改变训练数学**（只多一次验证前向 + 一次保存），所以带不带它学生权重一致。加了这个开关就能白拿一份教师权重去提交对比 |
+| `--img-size` | 224 | 输入分辨率。**必须是 patch 32 的倍数：224 / 256 / 288 / 320 / 352。336 不合法**（336/32=10.5，那是 ViT-L/14 的尺寸）。位置编码网格会自动双三次插值。**训练和推理必须一致** —— `infer.py` 从 checkpoint 里读，不用手动传 |
 
 > `noise stats` 里的四个数（`clean` / `relabel` / `noisy` / `unseen`）**加起来必须等于训练集大小**。
 > 如果 `noisy` 恰好等于 `max_noise_frac × N`，说明它长期撞在上限上——阈值对这个模型不成立，需要调。

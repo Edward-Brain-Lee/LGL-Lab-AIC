@@ -43,7 +43,8 @@ from torchvision import transforms
 
 import open_clip
 
-from train import CLIP_MEAN, CLIP_STD, ImageFolderNoisy, Net, check_backbone
+from train import (CLIP_MEAN, CLIP_STD, ImageFolderNoisy, Net, check_backbone,
+                   resize_positional_embedding, val_resize)
 
 
 @torch.no_grad()
@@ -71,8 +72,9 @@ def report(path, ck, model, device, a):
     ck_args = ck.get('args', {})
     data = a.data or ck_args.get('data')
     assert data, 'checkpoint has no --data recorded; pass --data explicitly'
+    img_size = ck.get('img_size', ck_args.get('img_size', 224))
     val_tf = transforms.Compose([
-        transforms.Resize(256), transforms.CenterCrop(224),
+        transforms.Resize(val_resize(img_size)), transforms.CenterCrop(img_size),
         transforms.ToTensor(), transforms.Normalize(CLIP_MEAN, CLIP_STD)])
     va = ImageFolderNoisy(data, val_tf, True, ck_args.get('val_ratio', 0.1),
                           ck_args.get('seed', 3407), 'val')
@@ -108,6 +110,12 @@ def main(a):
 
         clip_model = open_clip.create_model(model_name,
                                             pretrained=ck.get('pretrained', 'openai'))
+        # same resolution the checkpoint was trained at, or the frozen backbone and
+        # the LoRA weights it carries would disagree and every number below would be
+        # quietly wrong rather than obviously broken
+        img_size = ck.get('img_size', ck_args.get('img_size', 224))
+        if img_size != 224:             # at the trained size the grid already matches
+            resize_positional_embedding(clip_model.visual, img_size)
         model = Net(clip_model, len(ck['classes']), rank, target)
         missing, _ = model.load_state_dict(ck.get('model', ck), strict=False)
         lost = {n for n, p in model.named_parameters() if p.requires_grad} & set(missing)

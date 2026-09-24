@@ -30,6 +30,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
+from torchvision import transforms
 
 # --------------------------------------------------------------------------- #
 # stub out open_clip BEFORE train.py imports it
@@ -404,6 +405,98 @@ def check_lora():
     print(f'  lora/checkpoint ok ({len(sd)}/{len(net.state_dict())} tensors kept)')
 
 
+def check_pos_embed_resize():
+    """--img-size: the shape maths a two-hour run depends on, checked in a second.
+
+    open_clip does not resample the positional grid itself (``probe_resolution.py``
+    shows every non-224 size raising a shape error), so this helper has to get the
+    token count, the CLS token and the no-op case exactly right -- a 288 run with a
+    broken grid would train to a quietly worse number.
+    """
+    tower = types.SimpleNamespace(positional_embedding=torch.randn(1 + 7 * 7, 768),
+                                  image_size=(224, 224), grid_size=(7, 7),
+                                  patch_size=(32, 32))
+
+    assert train.resize_positional_embedding(tower, 224) == 7, '224 must keep the 7x7 grid'
+    assert tuple(tower.positional_embedding.shape) == (50, 768), '224 changed the shape'
+
+    assert train.resize_positional_embedding(tower, 288) == 9, '288 needs a 9x9 grid'
+    assert tuple(tower.positional_embedding.shape) == (82, 768), \
+        f'288 has the wrong token count: {tuple(tower.positional_embedding.shape)}'
+    assert tower.image_size == (288, 288), 'image_size bookkeeping not updated'
+    assert tower.grid_size == (9, 9), 'grid_size bookkeeping not updated'
+
+    # the CLS token is not part of the patch grid and must come through untouched
+    tower.positional_embedding = torch.randn(1 + 7 * 7, 768)
+    cls_before = tower.positional_embedding[0].clone()
+    train.resize_positional_embedding(tower, 320)
+    assert torch.equal(tower.positional_embedding[0], cls_before), \
+        'the CLS token was resampled along with the patch grid'
+
+    # a ramp laid out row-major must stay a ramp: this catches a grid that came back
+    # transposed or inverted, which a pure shape check would happily accept
+    ramp = torch.linspace(-1, 1, 49).view(49, 1).expand(49, 768).clone()
+    tower.positional_embedding = torch.cat([torch.zeros(1, 768), ramp]).clone()
+    train.resize_positional_embedding(tower, 288)
+    got = tower.positional_embedding[1:]
+    assert got.abs().max() < 2.0, \
+        f'resampled grid left its range: max |v| = {float(got.abs().max()):.2f}'
+    assert float(got[0].mean()) < float(got[-1].mean()), \
+        'the resampled grid came back inverted'
+
+    # the production tower holds an nn.Parameter, not a plain tensor, and that
+    # branch replaces the attribute rather than copying into it -- the shape change
+    # is exactly what copy_ refuses.  requires_grad has to survive the swap:
+    # checkpoints filter trainable tensors on that flag, so flipping it would leak
+    # the 350 MB frozen backbone into every snapshot.
+    mod = nn.Module()
+    mod.positional_embedding = nn.Parameter(torch.randn(1 + 7 * 7, 768), requires_grad=False)
+    mod.patch_size, mod.image_size, mod.grid_size = (32, 32), (224, 224), (7, 7)
+    train.resize_positional_embedding(mod, 288)
+    assert isinstance(mod.positional_embedding, nn.Parameter), \
+        'the parameter was replaced by a plain tensor'
+    assert tuple(mod.positional_embedding.shape) == (82, 768), \
+        f'parameter swap gave the wrong shape: {tuple(mod.positional_embedding.shape)}'
+    assert mod.positional_embedding.requires_grad is False, \
+        'requires_grad flipped -- the frozen backbone would leak into checkpoints'
+
+    # a size that is not a multiple of the patch size must be refused, not guessed
+    for bad in (336, 250):
+        try:
+            train.resize_positional_embedding(tower, bad)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f'--img-size {bad} was accepted; it should be refused')
+
+    assert train.val_resize(224) == 256, f'val_resize(224) = {train.val_resize(224)}, want 256'
+    assert train.val_resize(288) == 329, f'val_resize(288) = {train.val_resize(288)}, want 329'
+    print('  pos-embed resize ok')
+
+
+def check_img_size_transforms():
+    """The transform layer at a non-default --img-size, with no model involved.
+
+    A 288 run is only 288 if every transform actually emits 288x288.  The old code
+    hardcoded 224 in five places, and a missed one would not raise -- it would feed
+    224 images to a 9x9 grid and quietly train a worse model.  Pure torchvision, so
+    this runs anywhere.
+    """
+    for size in (224, 288):
+        val_tf = transforms.Compose([
+            transforms.Resize(train.val_resize(size)), transforms.CenterCrop(size),
+            transforms.ToTensor()])
+        got = tuple(val_tf(Image.new('RGB', (640, 480))).shape)
+        assert got == (3, size, size), f'the val transform emitted {got}, want 3x{size}x{size}'
+
+        for view in sorted(infer.TTA_VIEWS):   # every view, so adding one cannot slip past
+            vtf = infer.build_view_transform(*infer.TTA_VIEWS[view], size)
+            got = tuple(vtf(Image.new('RGB', (640, 480))).shape)
+            assert got == (3, size, size), \
+                f'TTA view "{view}" emitted {got} at --img-size {size}, want 3x{size}x{size}'
+    print('  img-size transforms ok')
+
+
 def check_end_to_end():
     tmp = Path(tempfile.mkdtemp())
     try:
@@ -470,6 +563,49 @@ def check_end_to_end():
         assert infer.adjusted_path('pred_results.csv', 1.0) == 'pred_results_tau100.csv'
         print('  logit-adjust ok')
 
+        # --tta.  The claim that makes the flag safe on a script two people share is
+        # that `plain` alone *is* the transform this file used before.  Assert that
+        # on the transform, not on the CSV: this self-test stubs open_clip with a
+        # freshly random backbone per create_model call, so two infer.main runs here
+        # disagree even when nothing changed.  On real OpenAI weights they agree --
+        # that is what the md5 comparison against a known submission is for.
+        legacy_tf = transforms.Compose([transforms.Resize(256), transforms.CenterCrop(224),
+                                        transforms.ToTensor(),
+                                        transforms.Normalize(train.CLIP_MEAN, train.CLIP_STD)])
+        probe_im = Image.new('RGB', (400, 300))
+        px = probe_im.load()
+        for y in range(300):                                # deliberately asymmetric
+            for x in range(400):
+                px[x, y] = (x % 256, y % 256, (x * y) % 256)
+        t_plain = infer.build_view_transform(*infer.TTA_VIEWS['plain'], 224)(probe_im)
+        t_flip = infer.build_view_transform(*infer.TTA_VIEWS['flip'], 224)(probe_im)
+        assert torch.allclose(t_plain, legacy_tf(probe_im)), \
+            '--tta plain is no longer the transform infer.py used before'
+        assert not torch.allclose(t_plain, t_flip), 'the flip view equals the plain view'
+        assert torch.allclose(t_plain, torch.flip(t_flip, dims=[2]), atol=1e-6), \
+            'the flip view is not the horizontal mirror of the plain view'
+
+        # the multi-view path must still emit exactly one valid row per test image
+        csv_tta = tmp / 'pred_tta.csv'
+        infer.main(infer.parse_args(['--test', str(root), '--checkpoint', str(out / 'best.pt'),
+                                     '--output', str(csv_tta), '--tta']))
+        rows_tta = list(csv.reader(csv_tta.open()))
+        assert len(rows_tta) == 32, f'--tta lost rows: {len(rows_tta)}'
+        assert len({r[0] for r in rows_tta}) == 32, 'duplicate file names under --tta'
+        assert all(len(r) == 2 and len(r[1]) == 4 and r[1].isdigit() for r in rows_tta), \
+            f'bad CSV rows under --tta: {rows_tta[:3]}'
+
+        # a typo must fail loudly rather than quietly falling back to one view
+        accepted_typo = False
+        try:
+            infer.main(infer.parse_args(['--test', str(root), '--checkpoint', str(out / 'best.pt'),
+                                         '--output', str(tmp / 'never.csv'), '--tta', 'Plane']))
+            accepted_typo = True
+        except AssertionError:
+            pass
+        assert not accepted_typo, '--tta accepted an unknown view name instead of failing'
+        print('  tta ok')
+
         # the error-analysis report must survive a model whose confusion
         # structure is whatever the stub happens to produce (including none)
         adir = tmp / 'analysis'
@@ -494,5 +630,7 @@ if __name__ == '__main__':
     check_targets()
     check_proto()
     check_lora()
+    check_pos_embed_resize()
+    check_img_size_transforms()
     check_end_to_end()
     print('ALL CHECKS PASSED')

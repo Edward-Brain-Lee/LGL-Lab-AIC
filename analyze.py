@@ -46,14 +46,16 @@ import open_clip
 import train as T
 
 
-def build_split(a, split):
+def build_split(a, split, img_size=224):
     """Rebuild the hold-out split exactly as ``train.py`` does.
 
     Membership depends only on ``(seed, val_ratio, val=...)``; the transform is
     passed here as the deterministic evaluation one so the numbers are stable.
+    ``img_size`` must come from the checkpoint -- analysing a 288 run with the 224
+    transform would still run, and every number it printed would be wrong.
     """
     val_tf = transforms.Compose([
-        transforms.Resize(256), transforms.CenterCrop(224),
+        transforms.Resize(T.val_resize(img_size)), transforms.CenterCrop(img_size),
         transforms.ToTensor(), transforms.Normalize(T.CLIP_MEAN, T.CLIP_STD)])
     return T.ImageFolderNoisy(a.data, val_tf, val=(split == 'val'),
                               val_ratio=a.val_ratio, seed=a.seed, split=split)
@@ -70,6 +72,9 @@ def load_model(a, device):
     T.check_backbone(model_name)
 
     clip_model = open_clip.create_model(model_name, pretrained=pretrained)
+    img_size = ck.get('img_size', ck_args.get('img_size', 224))
+    if img_size != 224:                 # at the trained size the grid already matches
+        T.resize_positional_embedding(clip_model.visual, img_size)
     model = T.Net(clip_model, len(classes), rank, target)
     missing, _ = model.load_state_dict(ck.get('model', ck), strict=False)
     trained = {n for n, p in model.named_parameters() if p.requires_grad}
@@ -78,8 +83,8 @@ def load_model(a, device):
     del clip_model
     model.to(device).eval()
     print(f'loaded {a.checkpoint} (epoch {ck.get("epoch", "?")}, {len(classes)} classes, '
-          f'{model_name}, lora rank {rank}/{target})')
-    return model, classes
+          f'{model_name}, lora rank {rank}/{target}, {img_size}px)')
+    return model, classes, img_size
 
 
 @torch.no_grad()
@@ -109,8 +114,8 @@ def quantiles(v, ps=(10, 25, 50, 75, 90)):
 
 def report(a):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model, classes = load_model(a, device)
-    ds = build_split(a, a.split)
+    model, classes, img_size = load_model(a, device)
+    ds = build_split(a, a.split, img_size)
     names = {i: n for n, i in classes.items()}
     print(f'{a.split} split: {len(ds)} images')
 

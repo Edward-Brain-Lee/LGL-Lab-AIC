@@ -67,6 +67,93 @@ def check_backbone(name):
             f'(allowed open_clip names: {sorted(ALLOWED_BACKBONES)}).')
 
 
+# --------------------------------------------------------------------------- #
+# input resolution
+# --------------------------------------------------------------------------- #
+# 256/224: the short side is scaled to ~114% of the crop, so CenterCrop keeps 87.5%
+# of the frame -- the ratio every previous run used.  Written as a ratio so that
+# --img-size can move without silently changing how much of the image survives the
+# crop; the 288 run should see the same 87.5%, just at more pixels.
+VAL_RESIZE_RATIO = 256 / 224
+
+
+def val_resize(img_size):
+    return int(round(img_size * VAL_RESIZE_RATIO))
+
+
+def resize_positional_embedding(visual, img_size):
+    """Resample the positional grid so the tower accepts ``img_size``.
+
+    open_clip's VisionTransformer does **not** interpolate on its own: it adds the
+    stored grid to whatever the patches produced and raises
+    ``The size of tensor a (82) must match the size of tensor b (50)`` for any size
+    other than the one it was trained at (``probe_resolution.py`` reproduces this
+    on this build).  OpenAI's ViT-B/32 was trained at 224 -- a 7x7 grid -- so 288
+    needs 9x9.
+
+    Bicubic resampling of the patch grid, CLS token left alone, is the standard
+    recipe (timm's ``resize_pos_embed``).  This is interpolation, not new
+    information: it only makes the shapes line up so fine-tuning can proceed, and
+    the fine-tuning is what has to earn any accuracy back.
+
+    Returns the grid size actually installed.  A no-op when it already matches.
+    """
+    patch = getattr(visual, 'patch_size', None)
+    if patch is None:
+        raise SystemExit('vision tower exposes no patch_size; cannot resize its grid')
+    patch = patch[0] if isinstance(patch, (tuple, list)) else patch
+    if img_size % patch:
+        raise SystemExit(
+            f'--img-size {img_size} is not a multiple of the patch size {patch} '
+            f'(legal: {patch * 7}, {patch * 8}, {patch * 9}, ...).  Note 336 does not '
+            f'divide by 32 -- that size belongs to CLIP ViT-L/14, not ViT-B/32.')
+    target = img_size // patch
+
+    # open_clip spells it `positional_embedding`, shape (1 + g*g, width).  timm
+    # spells it `pos_embed`, with a leading batch dimension.  Support both, since
+    # which one appears depends on how the tower was built.
+    name, batched = 'positional_embedding', False
+    pe = getattr(visual, name, None)
+    if pe is None:
+        name = 'pos_embed'
+        pe = getattr(visual, name, None)
+        batched = pe is not None and pe.dim() == 3
+    if pe is None:
+        raise SystemExit('no positional embedding found on the vision tower')
+
+    flat = pe[0] if batched else pe
+    n_tok, width = flat.shape
+    base = int(round((n_tok - 1) ** 0.5))
+    if base * base + 1 != n_tok:
+        raise SystemExit(f'{n_tok} positional tokens is not grid^2 + 1; cannot resample')
+    if base == target:
+        return base
+
+    cls, patches = flat[:1], flat[1:]
+    grid = patches.reshape(base, base, width).permute(2, 0, 1).unsqueeze(0).float()
+    resized = F.interpolate(grid, size=(target, target), mode='bicubic', align_corners=False)
+    resized = resized.squeeze(0).permute(1, 2, 0).reshape(target * target, width)
+    merged = torch.cat([cls.float(), resized], dim=0).to(pe.dtype).to(pe.device)
+    if batched:
+        merged = merged.unsqueeze(0)
+    # The attribute has to be *replaced*, not written into: `copy_` is an in-place
+    # copy and demands an identical shape, so it rejects the very growth this
+    # function exists to perform (50 -> 82 tokens).  Replacing is enough -- open_clip
+    # reads `self.positional_embedding` on every forward pass, so the next one picks
+    # the new grid up.  `requires_grad` is carried over so the frozen/not-frozen
+    # bookkeeping that checkpoints rely on does not change.
+    if isinstance(pe, nn.Parameter):
+        merged = nn.Parameter(merged, requires_grad=pe.requires_grad)
+    setattr(visual, name, merged)
+
+    # keep the tower's own bookkeeping consistent with the grid it now holds
+    if hasattr(visual, 'image_size'):
+        visual.image_size = (img_size, img_size)
+    if hasattr(visual, 'grid_size'):
+        visual.grid_size = (target, target)
+    return target
+
+
 def smooth_target(t, smooth, nclass):
     """Mix a one-hot-ish target towards uniform.
 
@@ -302,8 +389,10 @@ class ImageFolderNoisy(Dataset):
     list and is what the noise tracker and prototype bootstrap are keyed on.
     """
 
-    def __init__(self, root, transform, val=False, val_ratio=0.1, seed=3407, split='train'):
+    def __init__(self, root, transform, val=False, val_ratio=0.1, seed=3407, split='train',
+                 img_size=224):
         self.root, self.transform, self.split = Path(root), transform, split
+        self.img_size = img_size
         classes = sorted([p.name for p in self.root.iterdir() if p.is_dir()])
         self.class_to_idx = {c: i for i, c in enumerate(classes)}
         items = []
@@ -331,7 +420,7 @@ class ImageFolderNoisy(Dataset):
         try:
             return Image.open(path).convert('RGB')
         except Exception:                       # truncated / unreadable file
-            return Image.new('RGB', (224, 224), (127, 127, 127))
+            return Image.new('RGB', (self.img_size, self.img_size), (127, 127, 127))
 
     def __getitem__(self, i):
         path, y = self.items[i]
@@ -355,16 +444,16 @@ class TwoView(Dataset):
 
 def build_datasets(a):
     train_tf = transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(a.crop_min, 1.0)),
+        transforms.RandomResizedCrop(a.img_size, scale=(a.crop_min, 1.0)),
         transforms.RandomHorizontalFlip(),
         transforms.RandAugment(a.randaug_n, a.randaug_m),
         transforms.ToTensor(),
         transforms.Normalize(CLIP_MEAN, CLIP_STD)])
     val_tf = transforms.Compose([
-        transforms.Resize(256), transforms.CenterCrop(224),
+        transforms.Resize(val_resize(a.img_size)), transforms.CenterCrop(a.img_size),
         transforms.ToTensor(), transforms.Normalize(CLIP_MEAN, CLIP_STD)])
-    tr = ImageFolderNoisy(a.data, train_tf, False, a.val_ratio, a.seed, 'train')
-    va = ImageFolderNoisy(a.data, val_tf, True, a.val_ratio, a.seed, 'val')
+    tr = ImageFolderNoisy(a.data, train_tf, False, a.val_ratio, a.seed, 'train', a.img_size)
+    va = ImageFolderNoisy(a.data, val_tf, True, a.val_ratio, a.seed, 'val', a.img_size)
     assert len(tr) > 0, f'no images found under {a.data}'
     return tr, va
 
@@ -459,6 +548,9 @@ def main(a):
     print('config: ' + ' '.join(f'{k}={v}' for k, v in sorted(vars(a).items())))
 
     clip_model = open_clip.create_model(a.model, pretrained=a.pretrained)
+    if a.img_size != 224:
+        grid = resize_positional_embedding(clip_model.visual, a.img_size)
+        print(f'img_size={a.img_size}: positional grid resampled to {grid}x{grid}')
     model = Net(clip_model, nclass, a.lora_rank, a.lora_target,
                 a.proto_momentum, a.proto_temp).to(device)
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -632,9 +724,17 @@ def main(a):
         sched.step()
         vl, va_acc, va_hi = evaluate(model, vloader, device, amp_dtype, use_amp)
         score = va_acc if a.select == 'val_acc' else va_hi
+        t_acc = t_acc_hi = 0.0
+        if a.save_teacher:
+            # A second pass over the same hold-out. `evaluate` only reads, and the
+            # next epoch re-enters with `model.train()`, so the student is unaffected.
+            _, t_acc, t_acc_hi = evaluate(teacher, vloader, device, amp_dtype, use_amp)
         print(f'epoch {ep + 1}/{a.epochs} loss={running / max(seen, 1):.4f} '
               f'val_loss={vl:.4f} val_acc={va_acc:.4f} val_acc_hi={va_hi:.4f} '
               f'lr={opt.param_groups[0]["lr"]:.2e} time={time.time() - t0:.1f}s')
+        if a.save_teacher:
+            print(f'  [teacher] val_acc={t_acc:.4f} val_acc_hi={t_acc_hi:.4f}'
+                  f'   (student {va_acc:.4f} / {va_hi:.4f})')
 
         ck = {'model': model.trainable_state_dict(), 'classes': tr.class_to_idx,
               'class_counts': class_counts,
@@ -653,6 +753,21 @@ def main(a):
             # several epochs can be scored on the real leaderboard and the best
             # one picked, instead of trusting a proxy that rewards the failure.
             torch.save(thin(ck), out_dir / f'ep{ep + 1}.pt')
+        if a.save_teacher:
+            # Reuse the student's key set rather than `teacher.trainable_state_dict()`:
+            # every teacher parameter is requires_grad=False by construction, which is
+            # exactly the filter that method uses -- it would come back empty. The key
+            # names are identical (same architecture), so `thin()`/`infer.py` read a
+            # teacher snapshot with no changes.
+            tck = dict(ck)
+            tck['model'] = {k: v for k, v in teacher.state_dict().items()
+                            if k in ck['model']}
+            tck['val_acc'], tck['val_acc_hi'] = t_acc, t_acc_hi
+            thin_t = thin(tck)
+            if a.save_every and (ep + 1) % a.save_every == 0:
+                torch.save(thin_t, out_dir / f'teacher_ep{ep + 1}.pt')
+            if ep + 1 == a.epochs:
+                torch.save(thin_t, out_dir / 'teacher_last.pt')
         if score > best:
             best = score
             torch.save(thin(ck), out_dir / 'best.pt')
@@ -691,10 +806,26 @@ def parse_args(argv=None):
                         'raised by memorising that noise -- snapshots let the real '
                         'leaderboard pick the epoch instead.')
 
+    p.add_argument('--save-teacher', action='store_true', dest='save_teacher',
+                   help='also evaluate the EMA teacher each epoch and snapshot it as '
+                        'teacher_epN.pt. The teacher is the student\'s slow moving '
+                        'average, so it lags behind on exactly the label noise the '
+                        'student memorises -- when val_acc overstates the clean test '
+                        'score, this is the cheapest candidate that should not. It is '
+                        'a weight average of one model, not an ensemble (rule 五.4). '
+                        'Off by default: costs one extra validation pass per epoch.')
+
     p.add_argument('--lora-rank', type=int, default=8)
     p.add_argument('--lora-target', default='all', choices=['all', 'mlp'])
 
     p.add_argument('--crop-min', type=float, default=0.55)
+    p.add_argument('--img-size', type=int, default=224, dest='img_size',
+                   help='input resolution. Must be a multiple of ViT-B/32\'s patch size '
+                        '32: 224, 256, 288, 320, 352. The positional grid is bicubically '
+                        'resampled to match (open_clip does not do this itself). '
+                        '336 is NOT legal -- it belongs to CLIP ViT-L/14. Training and '
+                        'inference must agree; infer.py reads this back from the '
+                        'checkpoint, so it does not need passing there.')
     p.add_argument('--randaug-n', type=int, default=2)
     p.add_argument('--randaug-m', type=int, default=9)
 
