@@ -31,6 +31,7 @@ from pathlib import Path
 
 import torch
 from PIL import Image, ImageFile
+from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
 import open_clip
@@ -80,6 +81,47 @@ def build_view_transform(ratio, flip, img_size):
         ops.append(transforms.Lambda(lambda im: im.transpose(Image.FLIP_LEFT_RIGHT)))
     ops += [transforms.ToTensor(), transforms.Normalize(CLIP_MEAN, CLIP_STD)]
     return transforms.Compose(ops)
+
+
+def _one_thread_per_worker(worker_id):
+    """Give each DataLoader worker a single torch thread.
+
+    Doing the transforms in one process let torch spread its tiny tensor ops
+    (``ToTensor``/``Normalize`` on a few hundred MB) across every core -- measured
+    at ``TIME / ELAPSED ≈ 14.6`` on a 15-core box, and 8 views at 288px still took
+    ~1.9 hours.  12 single-threaded workers is both faster and far more honest
+    about where the time goes.  Only the workers are pinned; the parent keeps its
+    threads for the model forward.
+    """
+    torch.set_num_threads(1)
+
+
+class TTADataset(Dataset):
+    """One test image -> every view of it, stacked, plus its file name.
+
+    Decoding happens once per image and all views are cut from that one decode --
+    the views are transforms of the *image*, not of each other.  Returning the
+    stack (rather than one tensor per view) is what lets a worker transform all
+    views of a batch in parallel with the other workers.
+    """
+
+    def __init__(self, files, view_tfs, img_size):
+        self.files = files
+        self.view_tfs = list(view_tfs)
+        self.img_size = img_size
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, i):
+        p = self.files[i]
+        unreadable = 0
+        try:
+            img = Image.open(p).convert('RGB')
+        except Exception:                       # truncated / unreadable
+            img = Image.new('RGB', (self.img_size, self.img_size), (127, 127, 127))
+            unreadable = 1
+        return torch.stack([tf(img) for tf in self.view_tfs]), p.name, unreadable
 
 
 def main(a):
@@ -147,26 +189,34 @@ def main(a):
     print(f'{len(files)} test images found')
 
     # Logits are averaged over the views *before* the argmax, so every tau below
-    # still sees an ordinary logit tensor.  The PIL image is kept until all views
-    # have consumed it (the views are transforms of one decode, not of each other).
+    # still sees an ordinary logit tensor.
+    #
+    # The transforms run in DataLoader workers -- that is the whole point of
+    # TTADataset / _one_thread_per_worker.  The model forward still goes one view
+    # at a time, so the batch on the GPU is exactly the size it has always been no
+    # matter how many views are asked for.
+    ds = TTADataset(files, [view_tfs[v] for v in view_names], img_size)
+    loader_kwargs = {}
+    if a.workers > 0:
+        # One batch in flight per worker, not the default two.  A batch here is
+        # (B, V, 3, S, S) -- V times what the old one-view-at-a-time loop ever
+        # held -- so at --batch-size 256 with 8 views @320px that is ~2.5 GB per
+        # batch, and prefetching doubles it per worker.
+        loader_kwargs['prefetch_factor'] = 1
+    loader = DataLoader(ds, batch_size=a.batch_size, shuffle=False,
+                        num_workers=a.workers, pin_memory=(device.type == 'cuda'),
+                        worker_init_fn=_one_thread_per_worker, **loader_kwargs)
     logits, names, unreadable = [], [], 0
     with torch.no_grad():
-        for s in range(0, len(files), a.batch_size):
-            imgs = []
-            for p in files[s:s + a.batch_size]:
-                try:
-                    img = Image.open(p).convert('RGB')
-                except Exception:                       # truncated / unreadable
-                    img = Image.new('RGB', (img_size, img_size), (127, 127, 127))
-                    unreadable += 1
-                imgs.append(img)
-                names.append(p.name)
+        for views, batch_names, bad in loader:
+            # (B, V, 3, S, S) -- views[:, v] is view v of every image in the batch
             acc = None
-            for v in view_names:
-                batch = torch.stack([view_tfs[v](im) for im in imgs]).to(device)
-                out = model(batch).float().cpu()
+            for v in range(views.shape[1]):
+                out = model(views[:, v].to(device)).float().cpu()
                 acc = out if acc is None else acc + out
-            logits.append(acc / len(view_names))
+            logits.append(acc / views.shape[1])
+            names.extend(batch_names)
+            unreadable += int(bad.sum())
     logits = torch.cat(logits)
 
     for tau in (a.logit_adjust or [0.0]):
@@ -205,6 +255,11 @@ def parse_args(argv=None):
     p.add_argument('--output', default='pred_results.csv')
     p.add_argument('--pretrained', default='', help='override the CLIP weights (default: as in the checkpoint)')
     p.add_argument('--batch-size', type=int, default=256)
+    p.add_argument('--workers', type=int, default=8,
+                   help='processes decoding and transforming images.  The transforms '
+                        'dominate multi-view TTA -- 8 views used to take ~1.9 hours in '
+                        'one process.  0 runs them in this process (what the self-test '
+                        'uses, so it does not fork 8 workers for 32 images).')
     p.add_argument('--tta', nargs='*', default=None,
                    help='average the logits over deterministic views of the same image: '
                         'same model, same weights, same pipeline -- not an ensemble. '

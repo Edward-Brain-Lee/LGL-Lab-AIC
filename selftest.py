@@ -545,7 +545,7 @@ def check_end_to_end():
 
         csv_path = tmp / 'pred_results.csv'
         infer.main(infer.parse_args(['--test', str(root), '--checkpoint', str(out / 'best.pt'),
-                                     '--output', str(csv_path)]))
+                                     '--output', str(csv_path), '--workers', '0']))
         rows = list(csv.reader(csv_path.open()))
         assert len(rows) == 32, f'expected 32 predictions, got {len(rows)}'
         assert all(len(r) == 2 and r[0].endswith('.jpg') and len(r[1]) == 4 and r[1].isdigit()
@@ -556,6 +556,7 @@ def check_end_to_end():
         # several taus must come out of ONE forward pass, one CSV each
         infer.main(infer.parse_args(['--test', str(root), '--checkpoint', str(out / 'best.pt'),
                                      '--output', str(tmp / 'p.csv'),
+                                     '--workers', '0',
                                      '--logit-adjust', '0', '0.5', '1.0']))
         for f in ('p.csv', 'p_tau050.csv', 'p_tau100.csv'):
             assert (tmp / f).exists(), f'--logit-adjust did not write {f}'
@@ -588,7 +589,7 @@ def check_end_to_end():
         # the multi-view path must still emit exactly one valid row per test image
         csv_tta = tmp / 'pred_tta.csv'
         infer.main(infer.parse_args(['--test', str(root), '--checkpoint', str(out / 'best.pt'),
-                                     '--output', str(csv_tta), '--tta']))
+                                     '--output', str(csv_tta), '--tta', '--workers', '0']))
         rows_tta = list(csv.reader(csv_tta.open()))
         assert len(rows_tta) == 32, f'--tta lost rows: {len(rows_tta)}'
         assert len({r[0] for r in rows_tta}) == 32, 'duplicate file names under --tta'
@@ -599,7 +600,8 @@ def check_end_to_end():
         accepted_typo = False
         try:
             infer.main(infer.parse_args(['--test', str(root), '--checkpoint', str(out / 'best.pt'),
-                                         '--output', str(tmp / 'never.csv'), '--tta', 'Plane']))
+                                         '--output', str(tmp / 'never.csv'), '--tta', 'Plane',
+                                         '--workers', '0']))
             accepted_typo = True
         except AssertionError:
             pass
