@@ -69,6 +69,15 @@ class _StubVisual(nn.Module):
         self.stem = nn.Conv2d(3, in_dim, kernel_size=32, stride=32)   # patch embed
         self.proj = nn.Linear(in_dim, dim)                            # 1
         self.block = _StubBlock(dim)                                  # 3 more
+        # Enough of a positional grid for resize_positional_embedding /
+        # --train-pos-embed to be exercised here.  The stub's forward ignores it,
+        # exactly as a real tower would ignore a grid whose size it disagrees with
+        # -- which is why open_clip raises instead (see probe_resolution.py).
+        self.patch_size = (32, 32)
+        self.image_size = (224, 224)
+        self.grid_size = (7, 7)
+        self.positional_embedding = nn.Parameter(torch.randn(1 + 7 * 7, dim),
+                                                 requires_grad=False)
 
     def forward(self, x):
         if x.dim() == 4:                    # (B, 3, H, W) -> (B, in_dim)
@@ -497,6 +506,37 @@ def check_img_size_transforms():
     print('  img-size transforms ok')
 
 
+def check_train_pos_embed():
+    """--train-pos-embed: the flag must actually reach the optimiser AND the file.
+
+    A flag that silently did nothing would cost a 3-hour run to discover, so assert
+    the two things that matter: the grid ends up in `requires_grad` (which is what
+    the optimiser filters on) and in `trainable_state_dict()` (which is what the
+    checkpoint writes).  The second is the one that would fail quietly -- a grid
+    that trains but is never saved would be lost at inference time.
+    """
+    net = train.Net(_StubCLIP(), 4, 4, 'all')          # nclass 4, lora rank 4
+    pe = net.clip.visual.positional_embedding
+    assert not pe.requires_grad, 'the stub grid should start frozen, like the real one'
+
+    n = train.enable_pos_embed_training(net)
+    assert pe.requires_grad, 'the grid was not made trainable'
+    assert n == (1 + 7 * 7) * DIM, f'unexpected grid size {n}'
+
+    key = 'clip.visual.positional_embedding'
+    assert key in net.trainable_state_dict(), \
+        f'{key} did not reach trainable_state_dict -- it would be lost on save'
+    # ... and the flag must not have unlocked anything else in the backbone
+    trained = {k for k, v in net.state_dict().items()}
+    assert 'clip.visual.positional_embedding' in trained
+    frozen_leaked = [k for k, p in net.named_parameters()
+                     if p.requires_grad and not (k.endswith('.A') or k.endswith('.B')
+                                                 or k == key or k.startswith('head.')
+                                                 or k.startswith('proto.'))]
+    assert not frozen_leaked, f'--train-pos-embed unlocked more than the grid: {frozen_leaked[:3]}'
+    print('  train-pos-embed ok')
+
+
 def check_end_to_end():
     tmp = Path(tempfile.mkdtemp())
     try:
@@ -633,6 +673,7 @@ if __name__ == '__main__':
     check_proto()
     check_lora()
     check_pos_embed_resize()
+    check_train_pos_embed()
     check_img_size_transforms()
     check_end_to_end()
     print('ALL CHECKS PASSED')

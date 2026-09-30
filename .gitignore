@@ -1,0 +1,15 @@
+# Python bytecode -- generated locally on every run, never a source file
+__pycache__/
+*.pyc
+
+# Checkpoints and their snapshots.  These are hundreds of MB, they encode the
+# training data, and they are reproducible from the code + the official dataset.
+# Nothing in the repo reads them.
+*.pt
+
+# Training outputs (checkpoints, logs, per-run CSVs)
+outputs*/
+smoke*/
+
+# Analysis dumps
+analysis*/

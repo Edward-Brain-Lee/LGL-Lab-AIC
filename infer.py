@@ -50,31 +50,106 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 # of the frame survives independently of --img-size: 256/224 -> 87.5% (the
 # convention training and validation already use), 1.0 -> the whole frame,
 # 320/224 -> a tighter crop with more pixels per object.
+# (short-side ratio relative to the crop, horizontal flip, crop position).
+#
+# `ratio` picks the scale: 256/224 keeps 87.5% of the short side (the recipe
+# training and validation use), 1.0 keeps the whole frame, larger ratios crop
+# tighter and give the object more pixels.  `position` picks *where* the square
+# comes from -- `center` is what transforms.CenterCrop does, and the four corners
+# are the other half of the classic 5-crop recipe.  Every view up to 2026-09-26
+# was a centre crop, so spatial position was an axis nothing had touched.
 TTA_VIEWS = {
-    'plain':      (VAL_RESIZE_RATIO, False),   # 87.5% of the short side -- the training recipe
-    'flip':       (VAL_RESIZE_RATIO, True),
-    'mid':        (288 / 224, False),          # 77.8% -- a scale between plain and tight
-    'mid_flip':   (288 / 224, True),
-    'tight':      (320 / 224, False),          # 70% -- more pixels per object
-    'tight_flip': (320 / 224, True),
-    'wide':       (1.0, False),                # the whole frame -- open_clip's own recipe
-    'wide_flip':  (1.0, True),
+    'plain':      (VAL_RESIZE_RATIO, False, 'center'),   # 87.5% -- the training recipe
+    'flip':       (VAL_RESIZE_RATIO, True,  'center'),
+    'mid':        (288 / 224, False, 'center'),          # 77.8%
+    'mid_flip':   (288 / 224, True,  'center'),
+    'tight':      (320 / 224, False, 'center'),          # 70% -- more pixels per object
+    'tight_flip': (320 / 224, True,  'center'),
+    'wide':       (1.0, False, 'center'),                # whole frame -- open_clip's own recipe
+    'wide_flip':  (1.0, True,  'center'),
+    # corner crops at the training ratio -- spatial diversity, the missing half of
+    # 5-crop.  Only meaningful when ratio > 1, since at ratio 1.0 the short side is
+    # already the crop size and only the centre exists.
+    'tl':         (VAL_RESIZE_RATIO, False, 'top_left'),
+    'tr':         (VAL_RESIZE_RATIO, False, 'top_right'),
+    'bl':         (VAL_RESIZE_RATIO, False, 'bottom_left'),
+    'br':         (VAL_RESIZE_RATIO, False, 'bottom_right'),
+    # the same four corners mirrored -- 5-crop with flips, the full classic set
+    'tl_flip':    (VAL_RESIZE_RATIO, True,  'top_left'),
+    'tr_flip':    (VAL_RESIZE_RATIO, True,  'top_right'),
+    'bl_flip':    (VAL_RESIZE_RATIO, True,  'bottom_left'),
+    'br_flip':    (VAL_RESIZE_RATIO, True,  'bottom_right'),
+    # -- finer CENTRE scales.  The scale axis is the one that keeps paying (4 -> 8
+    # views was +0.364) and it has never been taken to saturation: the eight views
+    # above only cover 70% / 77.8% / 87.5% / 100%.  These four fill the gaps and
+    # push past `tight` towards more zoom, which fine-grained recognition usually
+    # rewards.  Corners are deliberately NOT included -- measured at -0.278.
+    'c94':        (1 / 0.94, False, 'center'),
+    'c94_flip':   (1 / 0.94, True,  'center'),
+    'c82':        (1 / 0.82, False, 'center'),
+    'c82_flip':   (1 / 0.82, True,  'center'),
+    'c64':        (1 / 0.64, False, 'center'),
+    'c64_flip':   (1 / 0.64, True,  'center'),
+    'c60':        (1 / 0.60, False, 'center'),
+    'c60_flip':   (1 / 0.60, True,  'center'),
 }
 
-# The four views measured at **66.2456** on the 2026-09-24 复赛 round (vs 64.16
-# single-view).  Bare `--tta` means this set, so the flag on its own reproduces the
-# known-good submission instead of the two-view minimum.
+# Bare `--tta` means the eight centre-crop views that scored **70.332** on
+# 2026-09-26, so the flag alone reproduces the best-known submission rather than
+# some minimum set.
 #
-# Measured separately: `wide` *alone* scores 62, i.e. 2.16 below `plain` -- the
+# Measured along the way: `wide` *alone* scores 62, i.e. 2.16 below `plain` -- the
 # model was trained on the plain crop, so a single switched framing is a
-# train/test mismatch.  The four-view average beats every one of its components,
-# so the gain is the averaging, not any one view.
-DEFAULT_TTA = ('plain', 'flip', 'wide', 'tight')
+# train/test mismatch.  The average beats every one of its components, so the gain
+# is the averaging, not any one view.  That is also why adding *mismatched* views
+# (extra scales, and now the corners) is worth trying.
+DEFAULT_TTA = ('plain', 'flip', 'mid', 'mid_flip', 'tight', 'tight_flip',
+               'wide', 'wide_flip')
+
+# Shorthands, so a 16-view run does not mean typing 16 names (and mistyping one,
+# which fails loudly but wastes a run).
+TTA_GROUPS = {
+    'center': DEFAULT_TTA,
+    'corners': ('tl', 'tr', 'bl', 'br', 'tl_flip', 'tr_flip', 'bl_flip', 'br_flip'),
+    'all': DEFAULT_TTA + ('tl', 'tr', 'bl', 'br', 'tl_flip', 'tr_flip', 'bl_flip', 'br_flip'),
+    # the eight fine centre scales on top -- 16 centre crops, no corners.  This is
+    # the experiment that probes whether the scale axis has saturated.
+    'scales': DEFAULT_TTA + ('c94', 'c94_flip', 'c82', 'c82_flip',
+                             'c64', 'c64_flip', 'c60', 'c60_flip'),
+}
 
 
-def build_view_transform(ratio, flip, img_size):
+def resolve_views(names):
+    """Expand group shorthands; leaves anything else alone for the caller to check."""
+    out = []
+    for n in names:
+        out.extend(TTA_GROUPS.get(n, (n,)))
+    seen, uniq = set(), []
+    for n in out:                       # de-duplicate but keep first-seen order
+        if n not in seen:
+            seen.add(n)
+            uniq.append(n)
+    return uniq
+
+
+def _positional_crop(img, size, position):
+    """Crop a ``size`` square out of ``img``, centre or corner.
+
+    Falls back to ``CenterCrop`` (which pads) when the image is smaller than the
+    crop, and that fallback also keeps ``position='center'`` bit-identical to the
+    ``CenterCrop`` this used to be -- the self-test asserts that equality.
+    """
+    w, h = img.size
+    if position == 'center' or w < size or h < size:
+        return transforms.functional.center_crop(img, size)
+    x = 0 if 'left' in position else w - size
+    y = 0 if 'top' in position else h - size
+    return img.crop((x, y, x + size, y + size))
+
+
+def build_view_transform(ratio, flip, position, img_size):
     ops = [transforms.Resize(int(round(img_size * ratio))),
-           transforms.CenterCrop(img_size)]
+           transforms.Lambda(lambda im: _positional_crop(im, img_size, position))]
     if flip:
         # a fixed Lambda rather than RandomHorizontalFlip(p=1.0): p=1.0 is in fact
         # deterministic, but the name invites the reader to assume it is not
@@ -177,9 +252,10 @@ def main(a):
     if a.tta is None:
         view_names = ['plain']
     else:
-        view_names = list(a.tta) or list(DEFAULT_TTA)       # bare `--tta`
+        view_names = resolve_views(list(a.tta) or list(DEFAULT_TTA))   # bare `--tta`
     unknown = sorted(set(view_names) - set(TTA_VIEWS))
-    assert not unknown, f'unknown --tta view(s) {unknown}; choose from {sorted(TTA_VIEWS)}'
+    assert not unknown, (f'unknown --tta view(s) {unknown}; choose from '
+                         f'{sorted(TTA_VIEWS)} or the groups {sorted(TTA_GROUPS)}')
     view_tfs = {v: build_view_transform(*TTA_VIEWS[v], img_size) for v in view_names}
     print(f'TTA views ({len(view_names)}) at {img_size}px: ' + ', '.join(view_names)
           + ('' if len(view_names) > 1 else '   [TTA off]'))
@@ -263,9 +339,11 @@ def parse_args(argv=None):
     p.add_argument('--tta', nargs='*', default=None,
                    help='average the logits over deterministic views of the same image: '
                         'same model, same weights, same pipeline -- not an ensemble. '
-                        'Bare `--tta` means "plain flip". Choices: '
-                        + '/'.join(sorted(TTA_VIEWS)) +
-                        '. Costs one forward pass per view. Off when omitted, which '
+                        'Bare `--tta` means the eight centre-crop views that scored '
+                        '70.332. Groups: ' + ', '.join(sorted(TTA_GROUPS)) +
+                        '. Individual views: ' + ', '.join(sorted(TTA_VIEWS)) +
+                        '. Costs one forward pass per view, with the transforms spread '
+                        'over --workers processes. Omitted entirely, the script '
                         'reproduces the previous single-view predictions exactly.')
     p.add_argument('--logit-adjust', type=float, nargs='*', default=[0.0], dest='logit_adjust',
                    metavar='TAU',

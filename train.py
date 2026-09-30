@@ -154,6 +154,39 @@ def resize_positional_embedding(visual, img_size):
     return target
 
 
+def enable_pos_embed_training(model):
+    """Make the vision tower's positional grid trainable (``--train-pos-embed``).
+
+    Why this exists: `resize_positional_embedding` can only *interpolate* the 7x7
+    grid OpenAI trained.  The interpolated grid is then frozen along with the rest
+    of the backbone, so the model carries that interpolation error forever and can
+    never correct it.  That is the mechanism behind the measured failure at 384px
+    (probe cosine 288: 0.9820 -> 320: 0.9683 -> 352: 0.9581; the teammate's 384 run
+    put val_acc 1.28 below 352) -- resolution is the only lever that kept paying,
+    and interpolation error is what eventually breaks it.
+
+    Letting the grid train is the standard recipe for fine-tuning a ViT at a
+    resolution it was not trained at: initialise by interpolation, then learn.
+    Cost is small -- 12x12x768 = 0.11M parameters on top of the 1.14M LoRA ones --
+    and it stays inside rule 五.2, which explicitly allows parameter-efficient
+    fine-tuning of the official weights.
+
+    Must be called AFTER ``Net(...)`` is built: ``Net.__init__`` freezes every
+    backbone parameter that is not a LoRA ``.A``/``.B``, so setting requires_grad
+    earlier would be undone.  It must also run before the optimiser is created and
+    before the EMA teacher is copied, so both pick the grid up.
+
+    Returns the number of parameters made trainable.
+    """
+    pe = getattr(model.clip.visual, 'positional_embedding', None)
+    if pe is None:                              # timm towers spell it `pos_embed`
+        pe = getattr(model.clip.visual, 'pos_embed', None)
+    if pe is None:
+        raise SystemExit('--train-pos-embed: the vision tower has no positional embedding')
+    pe.requires_grad_(True)
+    return pe.numel()
+
+
 def smooth_target(t, smooth, nclass):
     """Mix a one-hot-ish target towards uniform.
 
@@ -553,6 +586,10 @@ def main(a):
         print(f'img_size={a.img_size}: positional grid resampled to {grid}x{grid}')
     model = Net(clip_model, nclass, a.lora_rank, a.lora_target,
                 a.proto_momentum, a.proto_temp).to(device)
+    if a.train_pos_embed:
+        # after Net() (which freezes the backbone) and before the optimiser / teacher
+        n_pe = enable_pos_embed_training(model)
+        print(f'--train-pos-embed: positional grid is now trainable ({n_pe/1e3:.1f}k params)')
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f'model={a.model}/{a.pretrained} layers={model.n_lora} trainable params={n_train/1e6:.3f}M')
 
@@ -819,6 +856,16 @@ def parse_args(argv=None):
     p.add_argument('--lora-target', default='all', choices=['all', 'mlp'])
 
     p.add_argument('--crop-min', type=float, default=0.55)
+    p.add_argument('--train-pos-embed', action='store_true', dest='train_pos_embed',
+                   help='also train the vision tower\'s positional grid.  '
+                        'resize_positional_embedding() can only *interpolate* OpenAI\'s '
+                        '7x7 grid, and that interpolated grid is then frozen like the '
+                        'rest of the backbone -- the model carries the interpolation '
+                        'error forever.  That is what breaks 384px.  Letting the grid '
+                        'train (init by interpolation, then learn) is the standard '
+                        'recipe for fine-tuning a ViT at an unseen resolution; it adds '
+                        'only 0.11M parameters.  Off by default: at 224px the grid is '
+                        'the trained one and there is nothing to fix.')
     p.add_argument('--img-size', type=int, default=224, dest='img_size',
                    help='input resolution. Must be a multiple of ViT-B/32\'s patch size '
                         '32: 224, 256, 288, 320, 352. The positional grid is bicubically '
