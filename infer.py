@@ -1,74 +1,14 @@
 """Generate ``pred_results.csv`` for the official test set.
 
-**Single model, single set of trained weights** -- CLIP ViT-B/32 with the LoRA
-adapters and the cosine head produced by ``train.py``.
-
-TTA and test-time resolution
-----------------------------
-The competition permits test-time augmentation and a changed input resolution
-as long as the backbone architecture and the trained weights stay the same
-(README_AUTODL.md 5).  Both are implemented here, and both stay inside the
-"one model" rule:
-
-* every view runs **the same checkpoint**;
-* the per-view features are **averaged, not voted**: each view's feature is
-  already L2-normalised by ``Net.forward``, the mean is re-normalised once, and
-  the head is applied **once**.  There is a single decision path, so this is
-  TTA of one model and not an ensemble.  ``--tta-agg logit`` averages the
-  logits instead (also one model) -- the feature average is the default because
-  normalising before averaging keeps a badly-scaled view from dominating.
-
-Averaging the outputs of several *different* checkpoints (e.g. seed ensembles)
-is an ensemble and is **not** permitted.  Do not add it.
-
-There are two independent axes, and they are not equally safe:
-
-* ``--tta-crops`` changes only *which pixels of the one image* are fed to the
-  model.  All the policies in ``train.CROP_POLICIES`` stay inside the trained
-  patch grid, so no positional embedding is touched.  This axis is free of the
-  risk below.  It exists because the default ``center`` policy does not keep the
-  whole frame: measured, a 3:4 image keeps 57.5% of it, a 2:3 image 51.0%, and
-  even a square one only 76.6% (``Resize(size*256/224)`` + ``CenterCrop(size)``
-  removes the outer 1/8 of both axes whatever the shape).  On fine-grained
-  images the discriminative part is small and often not centred.
-* ``--tta-sizes`` changes the resolution, which means open_clip has to
-  interpolate the positional embeddings (``resize_pos_embed``).  That is
-  permitted, but it is the axis with real evidence against it -- and the
-  distinction that matters is **not** "bigger is worse", it is
-  **interpolate-only vs trained-there**:
-
-  - Evaluating at a size the weights never trained at is the case that is
-    documented to lose.  DeiT-tiny with interpolated pos-emb, no fine-tuning:
-    224: 72.2 -> 384: 71.2 -> 448: 68.8 -> 512: 65.9.  The community report
-    (open_clip Discussion #987) of CLIP-B/32 at 320 losing to 224 -- a single,
-    unreplicated datapoint with the training configuration unstated -- is most
-    likely this case, not a refutation of 320 itself.
-  - Training *at* the target size is the opposite: same backbone, same recipe,
-    only the fine-tuning resolution changed gives ViT-B/32 +2.1 at 384 and
-    +2.5 at 448 (timm/Cherti, ImageNet-1k).
-
-  So a checkpoint produced by ``train.py --image-size 320`` is in-distribution
-  at 320 and ``--tta-sizes 320`` adds a legitimate second view.  Pointing
-  ``--tta-sizes`` at a size the checkpoint was **not** trained at is the
-  configuration that is known to lose.  Measure it (``probe.py --tta``) before
-  trusting it, and read ``ck['image_size']`` first -- that is what ``base``
-  above comes from.
-
-Each distinct resolution needs its own ``open_clip.create_model`` call because
-``force_image_size`` (which resamples the positional embeddings) is applied at
-model-creation time; one model is built per size, loaded from the same
-checkpoint, used, and freed.
+One model -- CLIP ViT-B/32 with the LoRA adapters and the cosine head produced
+by ``train.py``.  A single forward pass per image by default; ``--tta`` averages
+the logits over a few deterministic views of the *same* image under the *same*
+weights, which is still one model on one inference pipeline, not an ensemble.
 
 Usage::
 
     python infer.py --test /root/autodl-tmp/test --checkpoint outputs/best.pt \
                     --output pred_results.csv
-    # one checkpoint, 3 crop policies x flip = 6 views, all at the training size:
-    python infer.py --test ... --checkpoint outputs/best.pt \
-                    --tta-crops center full pad --tta-flip
-    # and/or several resolutions (6 views) -- measure that one first:
-    python infer.py --test ... --checkpoint outputs/best.pt \
-                    --image-size 224 --tta-sizes 288 320 --tta-flip
 
 Every image found under ``--test`` produces exactly one CSV row.  An image that
 Pillow cannot decode is replaced by a grey image instead of being skipped, so a
@@ -90,12 +30,173 @@ import csv
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 from PIL import Image, ImageFile
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
 
-from train import IMG_EXTS, Net, build_clip, eval_transform
+import open_clip
+
+from train import (CLIP_MEAN, CLIP_STD, IMG_EXTS, VAL_RESIZE_RATIO, Net, check_backbone,
+                   resize_positional_embedding)
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+# Test-time-augmentation views.  Each is a *deterministic* transform of the same
+# image; the model and its weights are never touched, so this stays one model on
+# one inference pipeline (rule 五.4 bans multi-*model* ensembles, not multi-view
+# inference).
+#
+# The number is the short side *as a multiple of the crop*, so it controls how much
+# of the frame survives independently of --img-size: 256/224 -> 87.5% (the
+# convention training and validation already use), 1.0 -> the whole frame,
+# 320/224 -> a tighter crop with more pixels per object.
+# (short-side ratio relative to the crop, horizontal flip, crop position).
+#
+# `ratio` picks the scale: 256/224 keeps 87.5% of the short side (the recipe
+# training and validation use), 1.0 keeps the whole frame, larger ratios crop
+# tighter and give the object more pixels.  `position` picks *where* the square
+# comes from -- `center` is what transforms.CenterCrop does, and the four corners
+# are the other half of the classic 5-crop recipe.  Every view up to 2026-09-26
+# was a centre crop, so spatial position was an axis nothing had touched.
+TTA_VIEWS = {
+    'plain':      (VAL_RESIZE_RATIO, False, 'center'),   # 87.5% -- the training recipe
+    'flip':       (VAL_RESIZE_RATIO, True,  'center'),
+    'mid':        (288 / 224, False, 'center'),          # 77.8%
+    'mid_flip':   (288 / 224, True,  'center'),
+    'tight':      (320 / 224, False, 'center'),          # 70% -- more pixels per object
+    'tight_flip': (320 / 224, True,  'center'),
+    'wide':       (1.0, False, 'center'),                # whole frame -- open_clip's own recipe
+    'wide_flip':  (1.0, True,  'center'),
+    # corner crops at the training ratio -- spatial diversity, the missing half of
+    # 5-crop.  Only meaningful when ratio > 1, since at ratio 1.0 the short side is
+    # already the crop size and only the centre exists.
+    'tl':         (VAL_RESIZE_RATIO, False, 'top_left'),
+    'tr':         (VAL_RESIZE_RATIO, False, 'top_right'),
+    'bl':         (VAL_RESIZE_RATIO, False, 'bottom_left'),
+    'br':         (VAL_RESIZE_RATIO, False, 'bottom_right'),
+    # the same four corners mirrored -- 5-crop with flips, the full classic set
+    'tl_flip':    (VAL_RESIZE_RATIO, True,  'top_left'),
+    'tr_flip':    (VAL_RESIZE_RATIO, True,  'top_right'),
+    'bl_flip':    (VAL_RESIZE_RATIO, True,  'bottom_left'),
+    'br_flip':    (VAL_RESIZE_RATIO, True,  'bottom_right'),
+    # -- finer CENTRE scales.  The scale axis is the one that keeps paying (4 -> 8
+    # views was +0.364) and it has never been taken to saturation: the eight views
+    # above only cover 70% / 77.8% / 87.5% / 100%.  These four fill the gaps and
+    # push past `tight` towards more zoom, which fine-grained recognition usually
+    # rewards.  Corners are deliberately NOT included -- measured at -0.278.
+    'c94':        (1 / 0.94, False, 'center'),
+    'c94_flip':   (1 / 0.94, True,  'center'),
+    'c82':        (1 / 0.82, False, 'center'),
+    'c82_flip':   (1 / 0.82, True,  'center'),
+    'c64':        (1 / 0.64, False, 'center'),
+    'c64_flip':   (1 / 0.64, True,  'center'),
+    'c60':        (1 / 0.60, False, 'center'),
+    'c60_flip':   (1 / 0.60, True,  'center'),
+}
+
+# Bare `--tta` means the eight centre-crop views that scored **70.332** on
+# 2026-09-26, so the flag alone reproduces the best-known submission rather than
+# some minimum set.
+#
+# Measured along the way: `wide` *alone* scores 62, i.e. 2.16 below `plain` -- the
+# model was trained on the plain crop, so a single switched framing is a
+# train/test mismatch.  The average beats every one of its components, so the gain
+# is the averaging, not any one view.  That is also why adding *mismatched* views
+# (extra scales, and now the corners) is worth trying.
+DEFAULT_TTA = ('plain', 'flip', 'mid', 'mid_flip', 'tight', 'tight_flip',
+               'wide', 'wide_flip')
+
+# Shorthands, so a 16-view run does not mean typing 16 names (and mistyping one,
+# which fails loudly but wastes a run).
+TTA_GROUPS = {
+    'center': DEFAULT_TTA,
+    'corners': ('tl', 'tr', 'bl', 'br', 'tl_flip', 'tr_flip', 'bl_flip', 'br_flip'),
+    'all': DEFAULT_TTA + ('tl', 'tr', 'bl', 'br', 'tl_flip', 'tr_flip', 'bl_flip', 'br_flip'),
+    # the eight fine centre scales on top -- 16 centre crops, no corners.  This is
+    # the experiment that probes whether the scale axis has saturated.
+    'scales': DEFAULT_TTA + ('c94', 'c94_flip', 'c82', 'c82_flip',
+                             'c64', 'c64_flip', 'c60', 'c60_flip'),
+}
+
+
+def resolve_views(names):
+    """Expand group shorthands; leaves anything else alone for the caller to check."""
+    out = []
+    for n in names:
+        out.extend(TTA_GROUPS.get(n, (n,)))
+    seen, uniq = set(), []
+    for n in out:                       # de-duplicate but keep first-seen order
+        if n not in seen:
+            seen.add(n)
+            uniq.append(n)
+    return uniq
+
+
+def _positional_crop(img, size, position):
+    """Crop a ``size`` square out of ``img``, centre or corner.
+
+    Falls back to ``CenterCrop`` (which pads) when the image is smaller than the
+    crop, and that fallback also keeps ``position='center'`` bit-identical to the
+    ``CenterCrop`` this used to be -- the self-test asserts that equality.
+    """
+    w, h = img.size
+    if position == 'center' or w < size or h < size:
+        return transforms.functional.center_crop(img, size)
+    x = 0 if 'left' in position else w - size
+    y = 0 if 'top' in position else h - size
+    return img.crop((x, y, x + size, y + size))
+
+
+def build_view_transform(ratio, flip, position, img_size):
+    ops = [transforms.Resize(int(round(img_size * ratio))),
+           transforms.Lambda(lambda im: _positional_crop(im, img_size, position))]
+    if flip:
+        # a fixed Lambda rather than RandomHorizontalFlip(p=1.0): p=1.0 is in fact
+        # deterministic, but the name invites the reader to assume it is not
+        ops.append(transforms.Lambda(lambda im: im.transpose(Image.FLIP_LEFT_RIGHT)))
+    ops += [transforms.ToTensor(), transforms.Normalize(CLIP_MEAN, CLIP_STD)]
+    return transforms.Compose(ops)
+
+
+def _one_thread_per_worker(worker_id):
+    """Give each DataLoader worker a single torch thread.
+
+    Doing the transforms in one process let torch spread its tiny tensor ops
+    (``ToTensor``/``Normalize`` on a few hundred MB) across every core -- measured
+    at ``TIME / ELAPSED ≈ 14.6`` on a 15-core box, and 8 views at 288px still took
+    ~1.9 hours.  12 single-threaded workers is both faster and far more honest
+    about where the time goes.  Only the workers are pinned; the parent keeps its
+    threads for the model forward.
+    """
+    torch.set_num_threads(1)
+
+
+class TTADataset(Dataset):
+    """One test image -> every view of it, stacked, plus its file name.
+
+    Decoding happens once per image and all views are cut from that one decode --
+    the views are transforms of the *image*, not of each other.  Returning the
+    stack (rather than one tensor per view) is what lets a worker transform all
+    views of a batch in parallel with the other workers.
+    """
+
+    def __init__(self, files, view_tfs, img_size):
+        self.files = files
+        self.view_tfs = list(view_tfs)
+        self.img_size = img_size
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, i):
+        p = self.files[i]
+        unreadable = 0
+        try:
+            img = Image.open(p).convert('RGB')
+        except Exception:                       # truncated / unreadable
+            img = Image.new('RGB', (self.img_size, self.img_size), (127, 127, 127))
+            unreadable = 1
+        return torch.stack([tf(img) for tf in self.view_tfs]), p.name, unreadable
 
 
 def main(a):
@@ -107,21 +208,31 @@ def main(a):
     target = ck.get('lora_target', ck_args.get('lora_target', 'all'))
     pretrained = a.pretrained or ck.get('pretrained', 'openai')
     model_name = ck.get('model_name', ck_args.get('model', 'ViT-B-32-quickgelu'))
-    # build_clip calls check_backbone, i.e. it refuses to serve a checkpoint
-    # built on a tower that is not CLIP ViT-B/32.
+    check_backbone(model_name)      # refuse to serve a checkpoint built on a non-CLIP-ViT-B/32 tower
+    # Training and inference have to agree on the resolution: the positional grid is
+    # resampled for it and the transforms are built from it, so reading it back from
+    # the checkpoint (rather than defaulting to 224) is what keeps them in step.
+    img_size = a.img_size or ck.get('img_size', ck_args.get('img_size', 224))
+    # A checkpoint trained with --local-head carries local_head.proj/gate.  Rebuild
+    # the same architecture: load_state_dict(strict=False) would otherwise report
+    # those tensors as *unexpected* rather than missing, and the global-only model
+    # would run happily with a learned gate it never applies -- silently wrong
+    # predictions instead of a loud failure.
+    local_head = bool(ck.get('local_head', ck_args.get('local_head', False)))
+
+    clip_model = open_clip.create_model(model_name, pretrained=pretrained)
+    if img_size != 224:
+        grid = resize_positional_embedding(clip_model.visual, img_size)
+        print(f'img_size={img_size}: positional grid resampled to {grid}x{grid}')
+    model = Net(clip_model, len(classes), rank, target, local_head=local_head)
+    missing, _ = model.load_state_dict(ck.get('model', ck), strict=False)
+    trained = {n for n, p in model.named_parameters() if p.requires_grad}
+    lost = trained & set(missing)
+    assert not lost, f'checkpoint has no trained weights for: {sorted(lost)[:5]}'
+    del clip_model
+    model.to(device).eval()
     print(f'loaded {a.checkpoint} (epoch {ck.get("epoch", "?")}, '
           f'{len(classes)} classes, {model_name}, lora rank {rank}/{target})')
-
-    def make_model(size):
-        """One ``Net`` at ``size``, loaded from the checkpoint, on ``device``."""
-        clip_model = build_clip(model_name, pretrained, size)
-        net = Net(clip_model, len(classes), rank, target)
-        missing, _ = net.load_state_dict(ck.get('model', ck), strict=False)
-        trained = {n for n, p in net.named_parameters() if p.requires_grad}
-        lost = trained & set(missing)
-        assert not lost, f'checkpoint has no trained weights for: {sorted(lost)[:5]}'
-        del clip_model
-        return net.to(device).eval()
 
     # folder name -> four-digit submission label
     idx_to_label = {}
@@ -142,76 +253,53 @@ def main(a):
     elif any(a.logit_adjust):
         print('WARNING: checkpoint carries no usable class_counts -- --logit-adjust is ignored')
 
-    # ---- the eval-time views.  `--image-size 0` means "as trained".
-    base = a.image_size or ck.get('image_size', ck_args.get('image_size', 224))
-    sizes = [base] + [s for s in dict.fromkeys(a.tta_sizes) if s and s != base]
-    crops = list(dict.fromkeys(a.tta_crops)) or ['center']
-    views = [(s, c, f) for s in sizes for c in crops
-             for f in ((False, True) if a.tta_flip else (False,))]
+    # `--tta` absent -> ['plain'], which is byte-for-byte the transform this script
+    # used before, so leaving the flag off reproduces the previous predictions.
+    if a.tta is None:
+        view_names = ['plain']
+    else:
+        view_names = resolve_views(list(a.tta) or list(DEFAULT_TTA))   # bare `--tta`
+    unknown = sorted(set(view_names) - set(TTA_VIEWS))
+    assert not unknown, (f'unknown --tta view(s) {unknown}; choose from '
+                         f'{sorted(TTA_VIEWS)} or the groups {sorted(TTA_GROUPS)}')
+    view_tfs = {v: build_view_transform(*TTA_VIEWS[v], img_size) for v in view_names}
+    print(f'TTA views ({len(view_names)}) at {img_size}px: ' + ', '.join(view_names)
+          + ('' if len(view_names) > 1 else '   [TTA off]'))
 
     files = sorted(p for p in Path(a.test).rglob('*') if p.is_file() and p.suffix.lower() in IMG_EXTS)
     assert files, f'no images found under {a.test}'
-    n_img = len(files)
-    def vname(s, c, f):
-        """``288px`` for the plain default view, more when it is not that."""
-        bits = [f'{s}px']
-        if c != 'center':
-            bits.append(c)
-        if f:
-            bits.append('flip')
-        return ' '.join(bits)
+    print(f'{len(files)} test images found')
 
-    print(f'{n_img} test images found')
-    print(f'{len(views)} view(s): ' + ', '.join(vname(*v) for v in views) +
-          f'  (aggregation: {a.tta_agg})')
-
-    # fp32 by default.  Training evaluates in bf16, but a submission is a
-    # decision, and bf16's ~3 significant digits can flip a near tie in a
-    # 750-way argmax -- so the submission path stays where the scores we are
-    # comparing against were measured.  --amp bf16 is there for the multi-view
-    # sweeps, where the extra speed matters and the CSVs are only compared.
-    use_amp = a.amp == 'bf16' and device.type == 'cuda'
-    names, unreadable = [], 0
-    head, feat_sum, logit_sum = None, None, None
-    for vi, (size, crop, flip) in enumerate(views):
-        model = make_model(size)
-        tf = eval_transform(size, flip, crop=crop)
-        if head is None:
-            head = model.head        # same weights in every view; kept for the final decision
-        with torch.no_grad():
-            for s in range(0, n_img, a.batch_size):
-                ims = []
-                for p in files[s:s + a.batch_size]:
-                    try:
-                        img = Image.open(p).convert('RGB')
-                    except Exception:                   # truncated / unreadable
-                        img = Image.new('RGB', (size, size), (127, 127, 127))
-                        if vi == 0:                     # count each image once, not once per view
-                            unreadable += 1
-                    ims.append(tf(img))
-                    if vi == 0:
-                        names.append(p.name)
-                with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
-                    out, z = model(torch.stack(ims).to(device, non_blocking=True), return_feat=True)
-                # `z` is already L2-normalised by Net.forward
-                if a.tta_agg == 'feat':
-                    zz = z.float().cpu()
-                    feat_sum = zz if feat_sum is None else feat_sum + zz
-                else:
-                    oo = out.float().cpu()
-                    logit_sum = oo if logit_sum is None else logit_sum + oo
-        del model
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
-        print(f'  view {vi + 1}/{len(views)} done ({vname(size, crop, flip)})')
-
-    # one decision from the averaged views -- the head is applied exactly once
-    if a.tta_agg == 'feat':
-        feats = F.normalize(feat_sum / len(views), dim=-1)
-        with torch.no_grad():
-            logits = head(feats.to(device)).float().cpu()
-    else:
-        logits = logit_sum / len(views)
+    # Logits are averaged over the views *before* the argmax, so every tau below
+    # still sees an ordinary logit tensor.
+    #
+    # The transforms run in DataLoader workers -- that is the whole point of
+    # TTADataset / _one_thread_per_worker.  The model forward still goes one view
+    # at a time, so the batch on the GPU is exactly the size it has always been no
+    # matter how many views are asked for.
+    ds = TTADataset(files, [view_tfs[v] for v in view_names], img_size)
+    loader_kwargs = {}
+    if a.workers > 0:
+        # One batch in flight per worker, not the default two.  A batch here is
+        # (B, V, 3, S, S) -- V times what the old one-view-at-a-time loop ever
+        # held -- so at --batch-size 256 with 8 views @320px that is ~2.5 GB per
+        # batch, and prefetching doubles it per worker.
+        loader_kwargs['prefetch_factor'] = 1
+    loader = DataLoader(ds, batch_size=a.batch_size, shuffle=False,
+                        num_workers=a.workers, pin_memory=(device.type == 'cuda'),
+                        worker_init_fn=_one_thread_per_worker, **loader_kwargs)
+    logits, names, unreadable = [], [], 0
+    with torch.no_grad():
+        for views, batch_names, bad in loader:
+            # (B, V, 3, S, S) -- views[:, v] is view v of every image in the batch
+            acc = None
+            for v in range(views.shape[1]):
+                out = model(views[:, v].to(device)).float().cpu()
+                acc = out if acc is None else acc + out
+            logits.append(acc / views.shape[1])
+            names.extend(batch_names)
+            unreadable += int(bad.sum())
+    logits = torch.cat(logits)
 
     for tau in (a.logit_adjust or [0.0]):
         adj = logits if (not tau or log_prior is None) else logits - tau * log_prior
@@ -222,7 +310,7 @@ def main(a):
         print(f'wrote {len(rows)} rows to {out} (logit-adjust tau={tau:g})')
 
     print(f'unreadable images replaced by grey: {unreadable}')
-    if len(names) != n_img:
+    if len(names) != len(files):
         print('WARNING: row count does not match the number of test images')
     if len(set(names)) != len(names):
         print('WARNING: duplicate file names found -- the grader may match by name only')
@@ -249,6 +337,20 @@ def parse_args(argv=None):
     p.add_argument('--output', default='pred_results.csv')
     p.add_argument('--pretrained', default='', help='override the CLIP weights (default: as in the checkpoint)')
     p.add_argument('--batch-size', type=int, default=256)
+    p.add_argument('--workers', type=int, default=8,
+                   help='processes decoding and transforming images.  The transforms '
+                        'dominate multi-view TTA -- 8 views used to take ~1.9 hours in '
+                        'one process.  0 runs them in this process (what the self-test '
+                        'uses, so it does not fork 8 workers for 32 images).')
+    p.add_argument('--tta', nargs='*', default=None,
+                   help='average the logits over deterministic views of the same image: '
+                        'same model, same weights, same pipeline -- not an ensemble. '
+                        'Bare `--tta` means the eight centre-crop views that scored '
+                        '70.332. Groups: ' + ', '.join(sorted(TTA_GROUPS)) +
+                        '. Individual views: ' + ', '.join(sorted(TTA_VIEWS)) +
+                        '. Costs one forward pass per view, with the transforms spread '
+                        'over --workers processes. Omitted entirely, the script '
+                        'reproduces the previous single-view predictions exactly.')
     p.add_argument('--logit-adjust', type=float, nargs='*', default=[0.0], dest='logit_adjust',
                    metavar='TAU',
                    help='post-hoc logit adjustment: subtract tau*log(train class frequency) '
@@ -257,40 +359,11 @@ def parse_args(argv=None):
                         'accuracy. Several values give several CSVs from ONE forward pass, e.g. '
                         '--logit-adjust 0 0.25 0.5 1.0')
     p.add_argument('--lora-rank', type=int, default=0, help='override (default: as in the checkpoint)')
-    p.add_argument('--image-size', type=int, default=0,
-                   help='base (non-augmented) input resolution; 0 = as trained, which is '
-                        'recorded in the checkpoint. Anything else resamples the positional '
-                        'embeddings -- permitted, see README_AUTODL.md 5.')
-    p.add_argument('--tta-sizes', type=int, nargs='*', default=[], dest='tta_sizes',
-                   metavar='N',
-                   help='extra resolutions to average in, e.g. --tta-sizes 288 320. '
-                        'Same checkpoint, same head; features are averaged before a single '
-                        'decision, so this is TTA of one model, not an ensemble. Keep them '
-                        'multiples of the 32px patch size (288/320/352) -- 336 is a '
-                        'patch-14 number and train.build_clip will warn about it.')
-    p.add_argument('--tta-flip', action='store_true',
-                   help='also average the horizontally flipped image at every size '
-                        '(a cheap, well-behaved TTA for natural images)')
-    p.add_argument('--tta-crops', nargs='*', default=['center'], dest='tta_crops',
-                   metavar='POLICY',
-                   help='crop policies to average in, from train.CROP_POLICIES: '
-                        'center (default; resize short side to size*256/224 then centre '
-                        'crop -- throws away part of the frame), full (squash the whole '
-                        'image to size x size), pad (fit the long side and pad the rest: '
-                        'keeps both the content and the aspect ratio). All three stay '
-                        'inside the trained patch grid, so unlike --tta-sizes they need '
-                        'no positional-embedding interpolation. '
-                        'e.g. --tta-crops center full pad')
-    p.add_argument('--amp', default='none', choices=['none', 'bf16'],
-                   help='none (default) keeps the submission path in fp32, which is where the '
-                        'scores we compare against were measured. bf16 is ~2x faster and is '
-                        'fine for the multi-view sweeps -- but it can flip a near tie in a '
-                        '750-way argmax, so do not use it for the final submission without '
-                        'checking that it changes nothing.')
-    p.add_argument('--tta-agg', default='feat', choices=['feat', 'logit'], dest='tta_agg',
-                   help='feat: average the L2-normalised features then apply the head once '
-                        '(default). logit: apply the head per view then average the logits. '
-                        'Both use one checkpoint and one head.')
+    p.add_argument('--img-size', type=int, default=0, dest='img_size',
+                   help='override the input resolution (default: as recorded in the '
+                        'checkpoint args, else 224). Only needed to deliberately run a '
+                        'checkpoint at a size it was not trained at, which is usually '
+                        'worse -- training and inference are meant to agree.')
     return p.parse_args(argv)
 
 

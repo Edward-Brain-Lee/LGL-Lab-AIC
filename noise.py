@@ -32,13 +32,6 @@ class LabelTrustTracker:
     disagrees and ``max(p) <  tau_conf``                ``y``               ``w_noise``
     ==================================================  ==================  ==============
 
-    The first row is the one place the rule can feed on itself: the evidence is
-    the EMA of the *student's* teacher, so a sample the student has memorised --
-    including one whose given label is wrong -- ends up agreeing with itself and
-    is rewarded with full weight and a hard target, forever.  A :class:`FrozenJudge`
-    (see below) can veto that row; the veto only demotes the weight, it never
-    changes the label or the target.
-
     Samples the sampler has not drawn yet keep the given label at weight 1.
     ``max_noise_frac`` caps how much of the set may be declared untrusted, so a
     cold teacher early in training cannot throw away most of the data.
@@ -72,33 +65,7 @@ class LabelTrustTracker:
         self.weight = torch.ones(self.n, device=device)
         self.pred = self.y.clone()                       # teacher top-1, per sample
         self.mix = torch.zeros(self.n, device=device)    # target mass on `pred`
-        self.suspect = None                              # FrozenJudge veto, or None
         self.stats = {}
-
-    @torch.no_grad()
-    def reset(self):
-        """Drop the posterior EMA and its ``seen`` mask.
-
-        Called when the warm-up ends.  The EMA is updated from the very first
-        batch, but until warm-up finishes the teacher is an EMA of a randomly
-        initialised head, so what it accumulated is noise -- and because the
-        first observation of a sample is stored *verbatim*, that noise is not
-        washed out by later updates, it is decayed from.  Restarting here means
-        the next batch's posterior becomes the first observation, from a teacher
-        that has actually been trained.
-        """
-        self.prob.zero_()
-        self.seen.zero_()
-
-    @torch.no_grad()
-    def set_judge(self, suspect):
-        """Install the frozen-CLIP veto: ``suspect[i]`` -> never rewarded as clean.
-
-        See :class:`FrozenJudge`.  Only the agree branch is affected; the vetoed
-        samples fall through to the disagreement branches, which keep their label
-        and drop their weight.
-        """
-        self.suspect = None if suspect is None else suspect.to(self.device).bool()
 
     @torch.no_grad()
     def update(self, idx, prob):
@@ -126,14 +93,6 @@ class LabelTrustTracker:
         # cap pinned on every single epoch.  Agreement is evidence for the
         # label; only disagreement is evidence against it.
         agree = pred == self.y
-        vetoed = 0
-        if self.suspect is not None:
-            vetoed = int((agree & self.suspect).sum())
-            # An independent judge (frozen CLIP, which never saw the labels) says
-            # this sample is better explained by another class.  It may not be
-            # confirmed as clean, however confidently the student agrees with
-            # itself -- that is the loop this exists to break.
-            agree = agree & ~self.suspect
         relabel = judged & ~agree & (conf >= self.tau_conf)
         noisy = judged & ~agree & (conf < self.tau_conf)
 
@@ -164,7 +123,6 @@ class LabelTrustTracker:
             'clean': int(clean.sum()), 'relabel': int(relabel.sum()),
             'noisy': int(noisy.sum()), 'unseen': int((~judged).sum()),
             'capped': capped,           # rescued from `noisy` by max_noise_frac
-            'vetoed': vetoed,           # demoted by the frozen-CLIP judge
             'mean_trust': float(trust[judged].mean()) if bool(judged.any()) else 0.0,
             # How much of the training signal survives the weighting.  A collapse
             # here means the filtering is throwing the set away, which is worth
@@ -190,7 +148,7 @@ class LabelTrustTracker:
 
     def state_dict(self):
         return {'prob': self.prob, 'seen': self.seen, 'label': self.label, 'weight': self.weight,
-                'pred': self.pred, 'mix': self.mix, 'suspect': self.suspect}
+                'pred': self.pred, 'mix': self.mix}
 
     def load_state_dict(self, sd):
         self.prob.copy_(sd['prob'].to(self.device))
@@ -203,10 +161,6 @@ class LabelTrustTracker:
             self.pred.copy_(sd['pred'].to(self.device))
         if 'mix' in sd:
             self.mix.copy_(sd['mix'].to(self.device))
-        # ... and a checkpoint written before the judge existed must not be
-        # *silently* resumed with the old (self-confirming) rule either: `None`
-        # here just means no judge, which is what that checkpoint was trained with
-        self.suspect = None if sd.get('suspect') is None else sd['suspect'].to(self.device)
 
 
 def prototype_bootstrap(sum_feats, counts):
@@ -218,66 +172,3 @@ def prototype_bootstrap(sum_feats, counts):
     present = counts > 0
     means = sum_feats / counts.clamp_min(1)[:, None]
     return F.normalize(means.float(), dim=-1), present
-
-
-class FrozenJudge:
-    """An independent second opinion on every training sample, from frozen CLIP.
-
-    ``LabelTrustTracker`` judges a sample by the EMA of the *student's* teacher,
-    so once the student has memorised a label -- including a wrong one -- the
-    teacher agrees with it and :meth:`LabelTrustTracker.refresh` rewards it with
-    full weight and a hard target.  On this dataset that is not hypothetical: the
-    class folders are named by English search keywords, so folder ``0000/`` holds
-    bluebirds *and* a red "bluebird pure Sialia" water heater, and the only thing
-    that can contradict a memorised keyword is a model that never saw the labels.
-
-    Frozen CLIP is that model.  It is stored as one frozen feature per sample
-    (collected during the warm-up, from the same forward pass the prototype
-    bootstrap already needs) and scored against the frozen class centroids: a
-    sample is *suspect* when a different class's centroid is closer to it than
-    its own, by more than ``margin``.
-
-    Two caveats, both real:
-
-    * frozen CLIP is not right about every sample -- on a 750-class fine-grained
-      problem its NCC accuracy is far from 1, so a veto has a false-positive rate
-      that must be *measured* (``probe.py`` reports exactly this distribution)
-      before the flag is turned on in earnest;
-    * the veto therefore only ever **demotes** a sample.  It never relabels, and
-      the margin keeps near-ties out of it.
-    """
-
-    def __init__(self, n, dim, margin=0.0, device='cpu'):
-        self.device = device
-        self.margin = margin
-        self.feat = torch.zeros(n, dim, device=device)
-        self.seen = torch.zeros(n, dtype=torch.bool, device=device)
-
-    @torch.no_grad()
-    def add(self, idx, feats):
-        """Record the frozen features of one batch.  Later draws overwrite."""
-        idx = idx.to(self.device).long()
-        self.feat[idx] = feats.detach().float()
-        self.seen[idx] = True
-
-    @torch.no_grad()
-    def judge(self, means, given, present):
-        """``(suspect, top1, margin)`` for every sample.
-
-        ``means``/``present`` come from :func:`prototype_bootstrap`.  A class with
-        no warm-up samples has a zero centroid, and a zero centroid has cosine 0
-        against everything -- which would make it a *neutral* competitor that
-        beats a genuinely anti-correlated real class.  So its similarity is
-        forced to -2 rather than left implicit, and a sample whose own class is
-        absent is never judged either.
-        """
-        present = present.to(self.device).bool()
-        sim = F.normalize(self.feat, dim=-1) @ F.normalize(means.float(), dim=-1).t()
-        sim[:, ~present] = -2.0
-        own = sim.gather(1, given[:, None]).squeeze(1)
-        # the best class *other than* the given one: comparing against the global
-        # max would be wrong whenever the given class is not the runner-up
-        top2 = sim.topk(2, dim=1).values                      # (n, 2), tiny
-        other = torch.where(top2[:, 0] == own, top2[:, 1], top2[:, 0])
-        margin = other - own
-        return (margin > self.margin) & self.seen & present[given], sim.argmax(1), margin
