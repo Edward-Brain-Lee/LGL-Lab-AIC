@@ -109,7 +109,12 @@ def load_checkpoint(path, device):
         resize_positional_embedding(clip_model.visual, img_size)
     model = Net(clip_model, len(ck['classes']), rank, target, local_head=local_head,
                 lora_qkv=lora_qkv, lora_alpha=lora_alpha)
-    missing, _ = model.load_state_dict(ck.get('model', ck), strict=False)
+    missing, unexpected = model.load_state_dict(ck.get('model', ck), strict=False)
+    # `missing` is expected (the frozen backbone is absent by design); `unexpected`
+    # is not -- it means the checkpoint holds trained tensors this rebuild cannot
+    # place, i.e. the flags above do not match how the checkpoint was trained.
+    assert not unexpected, ('checkpoint carries trained weights this model cannot '
+                            f'hold -- rebuilt with the wrong flags? {sorted(unexpected)[:5]}')
     lost = {n for n, p in model.named_parameters() if p.requires_grad} & set(missing)
     assert not lost, f'no trained weights in checkpoint for: {sorted(lost)[:5]}'
     del clip_model
@@ -117,9 +122,15 @@ def load_checkpoint(path, device):
     visual = model.clip.visual
     pe_name = 'positional_embedding' if hasattr(visual, 'positional_embedding') else 'pos_embed'
     assert hasattr(visual, pe_name), 'vision tower exposes no positional embedding'
-    base_pe = getattr(visual, pe_name).detach().clone()
 
     model.to(device).eval()
+    # Clone AFTER .to(device).  at_resolution() reinstalls this as a Parameter, and
+    # open_clip's forward only casts the *dtype* -- transformer.py:791 is
+    # `x + self.positional_embedding.to(x.dtype)`, never `.to(x.device)` -- so a clone
+    # taken while the model was still on CPU lands a CPU tensor on a CUDA tower and
+    # the first forward raises a device mismatch.  CPU-only runs mask it, which is
+    # why this survived: mres.py had never been run on the GPU box.
+    base_pe = getattr(visual, pe_name).detach().clone()
     for p in model.parameters():
         p.requires_grad_(False)
     print(f'loaded {path} (epoch {ck.get("epoch", "?")}, {len(ck["classes"])} classes, '
@@ -167,8 +178,16 @@ def predict(model, files, view_names, res, a, device):
 
 
 def combine(per_res):
-    """Mean of the per-resolution softmaxes.  See :func:`predict` for why not logits."""
-    return torch.stack([lr.softmax(1) for lr in per_res]).mean(0) if len(per_res) > 1 else per_res[0]
+    """Mean of the per-resolution softmaxes.  See :func:`predict` for why not logits.
+
+    Softmax even for a single resolution.  `predict` returns *logits*, and
+    `write_submission` takes `.log()` of whatever this returns (mres.py:314, then
+    the class prior on top) -- so the old `else per_res[0]` handed raw logits to a
+    log, turning every negative score into a NaN label.  That is not a corner case:
+    `--mode test` with the default `--res 384` on a 384 checkpoint has exactly one
+    resolution in `order`, so this was the *normal* submission path.
+    """
+    return torch.stack([lr.softmax(1) for lr in per_res]).mean(0)
 
 
 def paired(base_pred, new_pred, y):
@@ -195,6 +214,12 @@ def evaluate(a):
                           ck_args.get('val_ratio', 0.1), ck_args.get('seed', 3407), 'val')
     assert va.class_to_idx == ck['classes'], 'val split found a different class list'
     files = [Path(p) for p, _ in va.items]
+    # labels are keyed by basename because that is what TTADataset hands back as its
+    # per-sample name and what `wanted` below is asserted against.  Two folders with
+    # the same basename would make that key ambiguous and silently mislabel the
+    # metric, so make it loud instead.
+    assert len({p.name for p in files}) == len(files), (
+        'the val split has duplicate basenames -- keying labels by name is ambiguous')
     label = {p.name: y for p, y in va.items}
     wanted = [p.name for p in files]
     n_cls = len(ck['classes'])
