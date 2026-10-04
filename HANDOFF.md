@@ -18,7 +18,7 @@
 | --- | --- |
 | 当前阶段 | **复赛（750 类）**，截止 2026-10-07 前后，**剩约 4 天** |
 | 云端训练环境 | AutoDL **RTX 4090 24GB**，数据/权重/依赖已就位；容器内存上限 **60 GiB** |
-| 主战场（云端） | `/root/autodl-tmp/AIC_orig/` = **唯一冲分场地**（71.2023 配方 = 71.1382 原树 + `--local-head`，§28） |
+| 主战场（云端） | `/root/autodl-tmp/` **顶层**——2026-10-03 起训练统一在这里（代码已融合整理，`AIC_orig/` 计划删除）。启动前按 §36.1 认树 |
 | 主战场（本地） | `C:\Users\Ed\Desktop\Recent Project\LGL-Lab-AIC\` —— **2026-10-02 起代码已换成 AIC_orig 基线副本**（§34），旧增强树存档在 `_backup_enhanced_20261002/` |
 | 平台最高分 | **72.2733** —— `384 + --train-pos-embed + --local-head + --lora-rank 16 + TTA8`（2026-10-03 开分，**§35**）。前一档 71.2023 = 同配方 `--lora-rank 8`，71.1382 = 再去掉 `--local-head` |
 | 最近一次开分 | `sub_lr16_tta8.zip`（384+pe+`--local-head`+`--lora-rank 16`，val_acc 0.7465）⇒ **72.2733**，比 71.2023 高 **+1.071**（§35）。同日另跑的 `--tau-conf 0.3`（val_acc 0.7371）**尚未提交** |
@@ -3967,3 +3967,97 @@ nohup python -u train.py --data /root/autodl-tmp/train \
 ```
 
 **启动必看 `trainable params=3.543M`（不是 2.658M）。**
+
+## 36. P0 落地：`--lora-rank 24` 启动清单（2026-10-03）
+
+**⚠️ 2026-10-03 用户决定：云端训练统一在 `/root/autodl-tmp/` 顶层进行，`AIC_orig/` 计划删除**（代码已融合整理）。下面所有命令都在顶层，不再进 `AIC_orig/`。
+
+**但"顶层现在还等于那棵 2796 行旧增强树"这件事必须先排除**（§29 的冒烟就跑在它上面，直接开跑会把"树 + rank"两个变量一起换掉）。**先认树再启动**：
+
+### 36.1 认树（10 秒，必须先做）
+
+```bash
+cd /root/autodl-tmp
+wc -l train.py infer.py
+sha256sum train.py infer.py | cut -c1-16
+grep -c lr_warmup_epochs train.py                     # 0 = 无 warm-up 开关（队友调度）
+grep -o "'--img-size'\|'--image-size'" train.py | sort -u
+grep -c "'--tta'" infer.py; grep -c 'tta-views' infer.py
+```
+
+判读：**1005 行 / `b444595f575c28d4`**（`infer.py` = `80992a0fd71e8ab9`、`--img-size`、`--tta`、`lr_warmup_epochs` 计数 0）⇒ 顶层就是产出 71.2023 / 72.2733 的那份代码，直接进 §36.2。
+若是 **2796 行 / `--image-size` / `tta-views`**，说明融合还没落到顶层，命令要按旧树 flag 面改写，先别开跑。
+若是**第三个 hash**（融合后的新代码）：**先确认默认行为没变**（尤其 `lr_warmup_epochs` 默认值、逐样本固定增强、tracker 重置这类"静默改训练数学"的项，§26）；默认动过的话，72.2733 就不再是同一个基线，rank 24 的本地 val_acc 只能和**同一棵树上再跑的 rank 8** 比。
+
+> **2026-10-03 实测（已核对）**：融合后的顶层 `train.py` = **1004 行 / `b444595f575c28d4`**、`infer.py` = **371 行 / `80992a0fd71e8ab9`**，`--img-size`、`--tta`、`lr_warmup_epochs` 计数 **0** ⇒ **与产出 71.2023 / 72.2733 的代码逐字节相同**，融合没有改训练数学。72.2733 仍是同一基线，rank 24 = 单变量。
+
+### 36.2 启动（唯一变量 = rank 8 → 24）
+
+```bash
+unset OMP_NUM_THREADS
+cd /root/autodl-tmp
+pgrep -af 'train\.py' | grep -v grep || echo 'no training running'
+nvidia-smi --query-gpu=memory.used,memory.total --format=csv
+cat /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.current
+df -h /root/autodl-tmp | tail -1
+
+nohup python -u train.py --data /root/autodl-tmp/train \
+  --out outputs_384pe_lr24 \
+  --epochs 20 --warmup-epochs 3 --batch-size 128 --workers 8 \
+  --img-size 384 --train-pos-embed --local-head --save-every 4 \
+  --lora-rank 24 > outputs_384pe_lr24.log 2>&1 &
+```
+
+注意本树**没有 `--lr-warmup-epochs`**（§34.3 第 1 条），不要加，加了 argparse 直接退出。
+**同一台机器上不许并发**：A 臂（`outputs_384pe_ctrl`，旧增强树）若还在跑，先 `pkill -f outputs_384pe_ctrl` —— 它自 §34.5 起只剩归因价值，且并发就是 §33.3 静默 SIGKILL 的成因。
+
+### 36.3 启动后 90 秒核对（三行必须同时成立）
+
+```bash
+grep -E 'trainable params|layers=|lora_rank' outputs_384pe_lr24.log | head
+```
+
+- `trainable params=3.543M`（不是 2.658M / 1.773M）
+- `layers=` 与 rank 8/16 那两次**逐字相同**（rank 不改层数）
+- 配置行里 `img_size=384`、`local_head=True`、`train_pos_embed=True`、`lora_rank=24`
+
+> **2026-10-03 实测（云端 750 类 / 384px 网格 / `--local-head` / `--train-pos-embed`）**：把
+> `Net(750, r, 'all', local_head=True)` + `enable_pos_embed_training` + `resize_positional_embedding(·, 384)`
+> 拆成分量数了一遍，**精确总数 = 3,542,786**，逐项：
+
+| 分量 | 数值 | 算式 |
+| --- | --- | --- |
+| `lora` | 2,654,208 | 24 × 110,592（每 +1 rank = 110,592，r=8 时 884,736） |
+| `pos_embed` | 111,360 | 145 × 768（384/32 = 12 ⇒ 12×12+1 = 145 token） |
+| `local_head` | 393,217 | 768 × 512 + 1 |
+| `head` | 384,001 | 750 × 512 **+ 1**（余弦头带一个标量——§35.7 记总数时漏了它，所以那组锚点每个都少 1） |
+| **合计** | **3,542,786 → `3.543M`** | r=8 对应 1,773,314 → `1.773M` |
+
+> 同一次检查里 `frozen leaked: NONE`——没有任何冻结权重进入 `requires_grad`，`trainable_state_dict()`
+> 不会把 350 MB 主干写进每个快照。另外 `Net(...)` 之后**必须**先 `resize_positional_embedding(·, 384)`
+> 再数：漏掉那一步网格停在 224 的 50 token，总数会读成 3,469,826（少 72,960），会误判成"少了东西"。
+
+### 36.4 跑完后的判据（**看 Δval_acc，不看绝对分**）
+
+| rank 24 的 `best val_acc` | 判读 | 动作 |
+| --- | --- | --- |
+| **≥ 0.7520**（Δ ≥ +0.55 vs rank16 的 0.7465） | 容量线仍在爬 | rank 32 立刻上第二台机器；线上预估 ≈ `val×100 − 2.4` ≈ **72.8+** |
+| 0.7470 ~ 0.7520（Δ 0 ~ +0.55） | 接近拐点 | 跑一次 rank 32 确认后停这条线 |
+| **≤ 0.7465**（Δ ≤ 0） | **8→16 是"跨阈值"，不是斜率** | 停 rank 线，把预算转给 `--tau-conf` / `--lora-target` |
+
+开分后补算 §35.5 的系数 `Δ线上 / Δval_acc`：**< 0.5 就是容量开始进噪声的预警**（对照：8→16 是 0.91）。
+
+### 36.5 推理（训练结束之后才跑，§33.3）
+
+```bash
+cd /root/autodl-tmp
+mkdir -p sub_lr24
+python -u infer.py --test /root/autodl-tmp/test \
+  --checkpoint outputs_384pe_lr24/best.pt \
+  --output sub_lr24/pred_results.csv --tta --workers 4 --batch-size 64
+stat -c %s sub_lr24/pred_results.csv                              # 1610092
+sed 's/\r$//' sub_lr24/pred_results.csv | awk 'END{print NR}'     # 37444
+cd sub_lr24 && zip ../sub_lr24_tta8.zip pred_results.csv
+```
+
+`--workers 4 --batch-size 64` 是 §35.3 定的统一值（62 GB 机器用 256/8 会 OOM）。**不要手动传 `--lora-rank`**：`infer.py` 从 checkpoint 读，传错不报错（`probe.py:820` 的坑）。
