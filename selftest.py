@@ -414,6 +414,96 @@ def check_lora():
     print(f'  lora/checkpoint ok ({len(sd)}/{len(net.state_dict())} tensors kept)')
 
 
+def check_lora_qkv_and_ln():
+    """``--lora-qkv`` / ``--lora-alpha`` / ``--train-ln``: widening the adapter sweep.
+
+    ``--lora-qkv`` exists because ``nn.MultiheadAttention`` keeps query/key/value in a
+    bare ``nn.Parameter`` (``in_proj_weight``), which an ``nn.Linear`` walk cannot see
+    -- so the projection that shapes q/k/v was frozen in every run before this flag.
+    A flag that "works" by quietly doing nothing costs a 3.5-hour run to discover, so
+    what is asserted here is numerics, then the module tree, then the checkpoint.
+    """
+    torch.manual_seed(0)
+
+    # 1) the replacement must be numerically identical to what it replaces, and the
+    #    frozen qkv weight must have been copied bit-exactly -- otherwise the adapted
+    #    model is no longer the model the official OpenAI weights describe
+    mha = nn.MultiheadAttention(DIM, 4, batch_first=True)
+    x = torch.randn(3, 5, DIM)
+    with torch.no_grad():
+        ref = mha(x, x, x, need_weights=False)[0]
+    wrapped = train.LoRAQKVAttention(mha)
+    wrapped.eval()
+    with torch.no_grad():
+        got = wrapped(x, x, x, need_weights=False)[0]
+    assert torch.allclose(ref, got, atol=1e-6), \
+        'LoRAQKVAttention is not identical to the attention it replaces at init'
+    with torch.no_grad():
+        assert torch.equal(wrapped.qkv.base.weight, mha.in_proj_weight), \
+            'the frozen qkv weight was not copied bit-exactly'
+        assert torch.equal(wrapped.qkv.base.bias, mha.in_proj_bias)
+        # ... and the update must actually reach the qkv path, not merely exist
+        wrapped.qkv.A.normal_()
+        wrapped.qkv.B.normal_()
+        moved = wrapped(x, x, x, need_weights=False)[0]
+    assert not torch.allclose(ref, moved, atol=1e-4), \
+        'a non-zero qkv adapter changed nothing -- the merged weight is not being used'
+
+    # 2) the tree --lora-qkv builds, and the one it must leave alone
+    base = train.Net(_StubCLIP(), 4, 4, 'all')
+    assert base.n_lora == 4, f'the default walk changed: {base.n_lora} layers'
+    q = train.Net(_StubCLIP(), 4, 4, 'all', lora_qkv=True)
+    assert q.n_lora == base.n_lora + 1, \
+        f'--lora-qkv wrapped {q.n_lora - base.n_lora} layers, want 1 (the qkv projection)'
+    assert not any(isinstance(m, nn.MultiheadAttention) for m in q.clip.visual.modules()), \
+        'the attention was not replaced, so qkv is still a bare Parameter'
+    assert isinstance(q.clip.visual.block.attn.qkv, train.LoRALinear)
+    assert isinstance(q.clip.visual.block.attn.out_proj, train.LoRALinear), \
+        '--lora-qkv dropped the out_proj adapter the old walk used to add'
+    # zero-init B means the flag must be an exact no-op at step 0: if it is not, every
+    # number in the run it is compared against is off by the size of the initial update
+    clip_q = _StubCLIP()
+    net_q = train.Net(clip_q, 4, 4, 'all', lora_qkv=True)
+    xq = torch.randn(3, 12)
+    with torch.no_grad():
+        frozen_q = F.normalize(clip_q.visual(xq), dim=-1)
+        assert torch.allclose(net_q(xq), net_q.head(frozen_q), atol=1e-6), \
+            '--lora-qkv is not identity at init'
+    # the adapters must reach the file, and the frozen qkv weight must not
+    sd = q.trainable_state_dict()
+    assert any(k.endswith('attn.qkv.A') for k in sd), 'the qkv adapter is not checkpointed'
+    assert any(k.endswith('attn.qkv.B') for k in sd)
+    assert not any(k.endswith('qkv.base.weight') for k in sd), \
+        'the frozen qkv weight leaked into the checkpoint'
+
+    # 3) alpha sets the effective step size; 0 keeps the historical 2*rank (scale 2),
+    #    which is the only reason a rank sweep compares like for like
+    assert train.Net(_StubCLIP(), 4, 4, 'all').lora_alpha == 8, \
+        'alpha 0 must mean 2*rank'
+    n16 = train.Net(_StubCLIP(), 4, 4, 'all', lora_alpha=16)
+    assert n16.lora_alpha == 16, '--lora-alpha did not reach the adapter'
+    assert n16.clip.visual.block.attn.out_proj.scale == 16 / 4, \
+        'alpha/rank was not propagated to the adapter scale'
+
+    # 4) train-ln: the norms become trainable, nothing else does
+    net = train.Net(_StubCLIP(), 4, 4, 'all')
+    lns = [m for m in net.clip.visual.modules() if isinstance(m, nn.LayerNorm)]
+    assert lns, 'the stub lost its LayerNorm: this check is no longer testing anything'
+    assert not any(p.requires_grad for m in lns for p in m.parameters()), \
+        'the stub LayerNorm should start frozen'
+    n_ln = train.enable_ln_training(net)
+    assert n_ln == sum(p.numel() for m in lns for p in m.parameters()) > 0
+    assert all(p.requires_grad for m in lns for p in m.parameters())
+    assert any(k.endswith('block.norm.weight') for k in net.trainable_state_dict()), \
+        'the trained norm is not checkpointed'
+    leaked = [k for k, p in net.named_parameters()
+              if p.requires_grad and not (k.endswith(('.A', '.B'))
+                                          or k.startswith(('head.', 'proto.'))
+                                          or '.norm' in k or '.ln_' in k)]
+    assert not leaked, f'--train-ln unlocked more than the norms: {leaked[:3]}'
+    print('  lora-qkv / lora-alpha / train-ln ok')
+
+
 def check_pos_embed_resize():
     """--img-size: the shape maths a two-hour run depends on, checked in a second.
 
@@ -593,6 +683,31 @@ def check_end_to_end():
         assert len({r[0] for r in rows}) == 32, 'duplicate file names in the CSV'
         print(f'  end-to-end ok ({len(rows)} predictions, sample {rows[0]})')
 
+        # --lora-qkv / --train-ln have to survive the WHOLE train -> save -> infer
+        # round trip, not just construction.  The failure this guards against is a
+        # checkpoint whose extra adapters never reached the file -- or never came back
+        # out of it -- which looks exactly like a normal run right up to the submission.
+        out2 = tmp / 'out2'
+        train.main(train.parse_args(['--data', str(root), '--out', str(out2),
+                                     '--epochs', '2', '--warmup-epochs', '1',
+                                     '--batch-size', '4', '--workers', '0',
+                                     '--val-ratio', '0.25', '--seed', '0', '--amp', 'none',
+                                     '--lora-rank', '4', '--lora-alpha', '8',
+                                     '--lora-qkv', '--train-ln']))
+        ck2 = torch.load(out2 / 'best.pt', map_location='cpu', weights_only=False)
+        assert ck2['lora_qkv'] is True and ck2['train_ln'] is True, sorted(ck2)
+        assert ck2['lora_alpha'] == 8, ck2['lora_alpha']
+        assert any(k.endswith('attn.qkv.A') for k in ck2['model']), \
+            'the qkv adapter did not survive into the checkpoint'
+        assert any('norm.weight' in k for k in ck2['model']), \
+            'the trained LayerNorm did not survive into the checkpoint'
+        csv_qkv = tmp / 'pred_qkv.csv'
+        infer.main(infer.parse_args(['--test', str(root), '--checkpoint', str(out2 / 'best.pt'),
+                                     '--output', str(csv_qkv), '--workers', '0']))
+        rows_qkv = list(csv.reader(csv_qkv.open()))
+        assert len(rows_qkv) == 32, f'--lora-qkv lost rows: {len(rows_qkv)}'
+        print('  lora-qkv / train-ln end-to-end ok')
+
         # several taus must come out of ONE forward pass, one CSV each
         infer.main(infer.parse_args(['--test', str(root), '--checkpoint', str(out / 'best.pt'),
                                      '--output', str(tmp / 'p.csv'),
@@ -672,6 +787,7 @@ if __name__ == '__main__':
     check_targets()
     check_proto()
     check_lora()
+    check_lora_qkv_and_ln()
     check_pos_embed_resize()
     check_train_pos_embed()
     check_img_size_transforms()

@@ -206,6 +206,16 @@ def main(a):
     ck_args = ck.get('args', {})
     rank = a.lora_rank or ck.get('lora_rank', ck_args.get('lora_rank', 8))
     target = ck.get('lora_target', ck_args.get('lora_target', 'all'))
+    # --lora-qkv / --lora-alpha change the module tree (the attention's fused qkv
+    # becomes a wrapped Linear), so they have to be rebuilt here too -- otherwise the
+    # adapter tensors are simply absent from the load, land in `missing`, and the
+    # `lost` assertion below is the only thing standing between that and silently
+    # frozen predictions
+    lora_qkv = bool(ck.get('lora_qkv', ck_args.get('lora_qkv', False)))
+    lora_alpha = float(ck.get('lora_alpha', ck_args.get('lora_alpha', 0.0)) or 0.0)
+    # --train-ln needs no rebuild (the LayerNorms are part of the tower either way and
+    # load by name); it is read back only to say in the log which recipe this is
+    train_ln = bool(ck.get('train_ln', ck_args.get('train_ln', False)))
     pretrained = a.pretrained or ck.get('pretrained', 'openai')
     model_name = ck.get('model_name', ck_args.get('model', 'ViT-B-32-quickgelu'))
     check_backbone(model_name)      # refuse to serve a checkpoint built on a non-CLIP-ViT-B/32 tower
@@ -224,7 +234,8 @@ def main(a):
     if img_size != 224:
         grid = resize_positional_embedding(clip_model.visual, img_size)
         print(f'img_size={img_size}: positional grid resampled to {grid}x{grid}')
-    model = Net(clip_model, len(classes), rank, target, local_head=local_head)
+    model = Net(clip_model, len(classes), rank, target, local_head=local_head,
+                lora_qkv=lora_qkv, lora_alpha=lora_alpha)
     missing, _ = model.load_state_dict(ck.get('model', ck), strict=False)
     trained = {n for n, p in model.named_parameters() if p.requires_grad}
     lost = trained & set(missing)
@@ -232,7 +243,8 @@ def main(a):
     del clip_model
     model.to(device).eval()
     print(f'loaded {a.checkpoint} (epoch {ck.get("epoch", "?")}, '
-          f'{len(classes)} classes, {model_name}, lora rank {rank}/{target})')
+          f'{len(classes)} classes, {model_name}, lora rank {rank}/{target}'
+          f'{", qkv" if lora_qkv else ""}{", train-ln" if train_ln else ""})')
 
     # folder name -> four-digit submission label
     idx_to_label = {}

@@ -97,6 +97,8 @@ def load_checkpoint(path, device):
     ck_args = ck.get('args', {})
     rank = ck.get('lora_rank', ck_args.get('lora_rank', 8))
     target = ck.get('lora_target', ck_args.get('lora_target', 'all'))
+    lora_qkv = bool(ck.get('lora_qkv', ck_args.get('lora_qkv', False)))
+    lora_alpha = float(ck.get('lora_alpha', ck_args.get('lora_alpha', 0.0)) or 0.0)
     model_name = ck.get('model_name', ck_args.get('model', 'ViT-B-32-quickgelu'))
     check_backbone(model_name)
     img_size = ck.get('img_size', ck_args.get('img_size', 224))
@@ -105,7 +107,8 @@ def load_checkpoint(path, device):
     clip_model = open_clip.create_model(model_name, pretrained=ck.get('pretrained', 'openai'))
     if img_size != 224:
         resize_positional_embedding(clip_model.visual, img_size)
-    model = Net(clip_model, len(ck['classes']), rank, target, local_head=local_head)
+    model = Net(clip_model, len(ck['classes']), rank, target, local_head=local_head,
+                lora_qkv=lora_qkv, lora_alpha=lora_alpha)
     missing, _ = model.load_state_dict(ck.get('model', ck), strict=False)
     lost = {n for n, p in model.named_parameters() if p.requires_grad} & set(missing)
     assert not lost, f'no trained weights in checkpoint for: {sorted(lost)[:5]}'

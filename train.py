@@ -27,6 +27,7 @@ bit-reproducible on the same GPU.
 import argparse
 import contextlib
 import copy
+import inspect
 import math
 import os
 import random
@@ -187,6 +188,35 @@ def enable_pos_embed_training(model):
     return pe.numel()
 
 
+def enable_ln_training(model):
+    """Make the tower's LayerNorm gains/biases trainable (``--train-ln``).
+
+    ``Net.__init__`` freezes every backbone parameter that is not a LoRA ``.A``/``.B``,
+    and ``ln_1`` / ``ln_2`` / ``ln_pre`` / ``ln_post`` fall under that blanket.  A
+    LoRA-only run can therefore rescale a sublayer's output but never re-centre it:
+    the normalisation stays at OpenAI's statistics while everything upstream of it has
+    moved.  Re-fitting those 1,536 numbers per norm is the cheapest half of BitFit: 26
+    norms (ln_pre + 12 x (ln_1, ln_2) + ln_post) x 1,536 = 39,936 parameters, and it
+    sits squarely inside rule 五.2, which allows
+    parameter-efficient fine-tuning of the official weights -- nothing here changes
+    which weights are loaded or which backbone is built.
+
+    Must be called after ``Net(...)`` and before the optimiser / EMA teacher, exactly
+    like :func:`enable_pos_embed_training`.
+
+    Returns the number of parameters made trainable.
+    """
+    n = 0
+    for _, mod in model.clip.visual.named_modules():
+        if isinstance(mod, nn.LayerNorm):
+            for p in mod.parameters(recurse=False):
+                p.requires_grad_(True)
+                n += p.numel()
+    if n == 0:
+        raise SystemExit('--train-ln: the vision tower exposes no LayerNorm layers')
+    return n
+
+
 def smooth_target(t, smooth, nclass):
     """Mix a one-hot-ish target towards uniform.
 
@@ -283,17 +313,113 @@ class LoRALinear(nn.Module):
         return self.base(x) + F.linear(self.drop(x), self.B @ self.A) * self.scale
 
 
-def add_lora(module, rank=8, alpha=16, dropout=0.05, target='all', prefix=''):
-    """Wrap every ``nn.Linear`` of ``module`` (``target='mlp'``: MLP only)."""
+# ``is_causal`` / ``average_attn_weights`` were added to the functional attention
+# entry point at different torch versions; probing the signature once keeps
+# LoRAQKVAttention callable on whatever torch the container has.
+_MHA_FORWARD_PARAMS = set(inspect.signature(F.multi_head_attention_forward).parameters)
+
+
+class LoRAQKVAttention(nn.Module):
+    """``nn.MultiheadAttention`` whose fused qkv projection also carries a LoRA update.
+
+    ``add_lora`` walks ``nn.Linear`` children, and this is the one projection that gets
+    away: ``nn.MultiheadAttention`` keeps query/key/value in a bare ``nn.Parameter``
+    (``in_proj_weight``, shape ``(3*dim, dim)``), which a module walk never sees.
+    The parameter arithmetic pins the size of the hole exactly -- ViT-B/32 has 36
+    wrapped modules, and ``out_proj`` (768+768) + ``c_fc`` (768+3072) + ``c_proj``
+    (3072+768) = 9,216 per block x 12 = 110,592 per rank, which is precisely what
+    ``--lora-rank`` costs today.  The qkv projection would add another
+    (768+2304) x 12 = 36,864 per rank, a third on top, in the tensors that actually
+    shape queries and keys.
+
+    ``F.multi_head_attention_forward`` reads qkv as a *Tensor*, so unlike ``out_proj``
+    a merged-weight property cannot be handed to it.  The projection is therefore
+    rebuilt as a plain ``nn.Linear`` -- so the ordinary walk from :func:`add_lora`
+    wraps it on the next pass and the merged matrix shows up as ``self.qkv.weight`` --
+    and the functional entry point is called directly with this module's config.
+
+    Only built when ``--lora-qkv`` is passed, so every existing checkpoint and result
+    keeps its exact module tree.
+    """
+
+    def __init__(self, mha):
+        super().__init__()
+        dim = mha.embed_dim
+        qkv = nn.Linear(dim, 3 * dim, bias=mha.in_proj_bias is not None)
+        with torch.no_grad():
+            qkv.weight.copy_(mha.in_proj_weight)
+            if qkv.bias is not None:
+                qkv.bias.copy_(mha.in_proj_bias)
+        self.qkv = qkv                       # add_lora turns this into a LoRALinear
+        self.out_proj = mha.out_proj         # ditto -- keeps the existing out_proj LoRA
+        self.embed_dim, self.num_heads = mha.embed_dim, mha.num_heads
+        self.dropout, self.batch_first = mha.dropout, mha.batch_first
+        self.kdim, self.vdim = mha.kdim, mha.vdim
+        self.add_zero_attn = mha.add_zero_attn
+        # CLIP builds attention with add_bias_kv=False, so these stay None
+        self.bias_k = self.bias_v = None
+
+    def forward(self, query, key, value, key_padding_mask=None, need_weights=True,
+                attn_mask=None, average_attn_weights=True, is_causal=False):
+        key = query if key is None else key
+        value = key if value is None else value
+        # F.multi_head_attention_forward speaks (L, N, E) only; nn.MultiheadAttention
+        # does this transpose itself, so it has to be reproduced here to stay a
+        # drop-in.  open_clip builds batch_first=False, but the stub in selftest.py
+        # does not, and neither would a future backbone.
+        if self.batch_first:
+            query, key, value = (t.transpose(0, 1) for t in (query, key, value))
+        kw = {'training': self.training, 'key_padding_mask': key_padding_mask,
+              'need_weights': need_weights, 'attn_mask': attn_mask}
+        if 'average_attn_weights' in _MHA_FORWARD_PARAMS:
+            kw['average_attn_weights'] = average_attn_weights
+        if 'is_causal' in _MHA_FORWARD_PARAMS:
+            kw['is_causal'] = is_causal
+        # positional order is (query, key, value, embed_dim, num_heads, in_proj_weight,
+        # in_proj_bias, bias_k, bias_v, add_zero_attn, dropout_p, out_proj_weight,
+        # out_proj_bias) -- the merged LoRALinear weights are what make the adapters
+        # on both attention projections take effect on this path
+        out, w = F.multi_head_attention_forward(
+            query, key, value, self.embed_dim, self.num_heads,
+            self.qkv.weight, self.qkv.bias,
+            self.bias_k, self.bias_v, self.add_zero_attn, self.dropout,
+            self.out_proj.weight, self.out_proj.bias, **kw)
+        if self.batch_first:
+            out = out.transpose(0, 1)
+        # `w` is left as the functional layer returns it: the weight layout for
+        # batch_first changed across torch versions, and every call site in this
+        # project (and in open_clip) passes need_weights=False.  Returning it
+        # untransposed is honest about that rather than silently version-dependent.
+        return out, w
+
+
+def add_lora(module, rank=8, alpha=16, dropout=0.05, target='all', prefix='', qkv=False):
+    """Wrap every ``nn.Linear`` of ``module`` (``target='mlp'``: MLP only).
+
+    ``qkv=True`` additionally rebuilds each attention block as a
+    :class:`LoRAQKVAttention`, which brings the fused qkv projection into the sweep
+    (see that class for why the walk misses it otherwise).
+    """
     n = 0
     for name, child in list(module.named_children()):
         full = f'{prefix}.{name}' if prefix else name
+        if isinstance(child, LoRALinear):
+            # already adapted; recursing would find ``base`` and wrap it a second time
+            continue
+        if qkv and isinstance(child, nn.MultiheadAttention):
+            child = LoRAQKVAttention(child)
+            setattr(module, name, child)
+            n += add_lora(child, rank, alpha, dropout, target, full, qkv)
+            continue
         is_mlp = name in ('fc1', 'fc2', 'c_fc', 'c_proj', 'mlp')
-        if isinstance(child, nn.Linear) and 'head' not in full.lower() and (target == 'all' or is_mlp):
+        # the rebuilt projection is named 'qkv'; --lora-qkv is what asked for it, so it
+        # is adapted even under --lora-target mlp (out_proj stays MLP-gated as before)
+        wanted = target == 'all' or is_mlp or (qkv and name == 'qkv')
+        if isinstance(child, nn.Linear) and 'head' not in full.lower() and wanted:
             setattr(module, name, LoRALinear(child, rank, alpha, dropout))
             n += 1
         else:
-            n += add_lora(child, rank, alpha, dropout, target, full)
+            n += add_lora(child, rank, alpha, dropout, target, full, qkv)
     return n
 
 
@@ -420,13 +546,19 @@ class ProtoHead(nn.Module):
 
 class Net(nn.Module):
     def __init__(self, clip_model, nclass, lora_rank=8, lora_target='all',
-                 proto_momentum=0.99, proto_temp=0.1, local_head=False):
+                 proto_momentum=0.99, proto_temp=0.1, local_head=False,
+                 lora_qkv=False, lora_alpha=0.0):
         super().__init__()
         self.clip = clip_model
         dim = clip_model.visual.output_dim
         self.head = CosineClassifier(dim, nclass)
         self.proto = ProtoHead(dim, nclass, proto_momentum, proto_temp)
-        self.n_lora = add_lora(self.clip.visual, lora_rank, 2 * lora_rank, target=lora_target)
+        # alpha/rank is the adapter's effective step size; --lora-alpha 0 keeps the
+        # 2*rank every run so far used, which fixes the ratio at 2 whatever the rank
+        alpha = lora_alpha if lora_alpha > 0 else 2 * lora_rank
+        self.lora_alpha, self.lora_qkv = alpha, lora_qkv
+        self.n_lora = add_lora(self.clip.visual, lora_rank, alpha,
+                               target=lora_target, qkv=lora_qkv)
         for name, p in self.clip.named_parameters():
             if not ('.A' in name or '.B' in name):
                 p.requires_grad = False
@@ -618,8 +750,8 @@ def evaluate(model, loader, device, amp_dtype, use_amp):
 # what an inference-only checkpoint needs; everything else (optimiser, RNG,
 # tracker) is only read back by `--resume`, which only ever loads `last.pt`
 SNAPSHOT_KEYS = ('model', 'classes', 'class_counts', 'args', 'epoch', 'val_acc',
-                 'val_acc_hi', 'lora_rank', 'lora_target', 'pretrained', 'model_name',
-                 'local_head')
+                 'val_acc_hi', 'lora_rank', 'lora_target', 'lora_alpha', 'lora_qkv',
+                 'train_ln', 'pretrained', 'model_name', 'local_head')
 
 
 def thin(ck):
@@ -662,13 +794,18 @@ def main(a):
         grid = resize_positional_embedding(clip_model.visual, a.img_size)
         print(f'img_size={a.img_size}: positional grid resampled to {grid}x{grid}')
     model = Net(clip_model, nclass, a.lora_rank, a.lora_target,
-                a.proto_momentum, a.proto_temp, a.local_head).to(device)
+                a.proto_momentum, a.proto_temp, a.local_head,
+                a.lora_qkv, a.lora_alpha).to(device)
     if a.train_pos_embed:
         # after Net() (which freezes the backbone) and before the optimiser / teacher
         n_pe = enable_pos_embed_training(model)
         print(f'--train-pos-embed: positional grid is now trainable ({n_pe/1e3:.1f}k params)')
+    if a.train_ln:
+        n_ln = enable_ln_training(model)
+        print(f'--train-ln: LayerNorm gains/biases are now trainable ({n_ln/1e3:.1f}k params)')
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f'model={a.model}/{a.pretrained} layers={model.n_lora} trainable params={n_train/1e6:.3f}M')
+    print(f'model={a.model}/{a.pretrained} layers={model.n_lora} lora_alpha={model.lora_alpha:g} '
+          f'lora_qkv={model.lora_qkv} trainable params={n_train/1e6:.3f}M')
 
     teacher = copy.deepcopy(model).to(device).eval()
     for p in teacher.parameters():
@@ -854,6 +991,8 @@ def main(a):
               'class_counts': class_counts,
               'args': vars(a), 'epoch': ep, 'val_acc': va_acc, 'val_acc_hi': va_hi,
               'lora_rank': a.lora_rank, 'lora_target': a.lora_target, 'pretrained': a.pretrained,
+              'lora_alpha': a.lora_alpha, 'lora_qkv': bool(a.lora_qkv),
+              'train_ln': bool(a.train_ln),
               'model_name': a.model, 'local_head': bool(a.local_head),
               'optim': opt.state_dict(), 'sched': sched.state_dict(), 'tracker': tracker.state_dict(),
               'rng': {'torch': torch.get_rng_state(),
@@ -931,6 +1070,29 @@ def parse_args(argv=None):
 
     p.add_argument('--lora-rank', type=int, default=8)
     p.add_argument('--lora-target', default='all', choices=['all', 'mlp'])
+
+    p.add_argument('--lora-qkv', action='store_true', dest='lora_qkv',
+                   help='also adapt each attention block\'s fused qkv projection.  '
+                        'nn.MultiheadAttention keeps query/key/value in a bare '
+                        'nn.Parameter, which the nn.Linear walk never sees, so the '
+                        'projection that shapes q/k/v has been frozen in every run so '
+                        'far -- worth (768+2304)x12 = 36,864 parameters per rank, a '
+                        'third on top of the 110,592 the sweep already touches.  Off '
+                        'by default: with it off the module tree is bit-identical to '
+                        'the runs that produced 71.2023 / 72.2733.')
+    p.add_argument('--lora-alpha', type=float, default=0.0, dest='lora_alpha',
+                   help='LoRA alpha; the update is scaled by alpha/rank, so this sets '
+                        'the adapter\'s effective step size.  0 (default) means '
+                        '2*rank, i.e. scale 2 -- the value every run so far used, and '
+                        'the only reason a rank sweep compares like for like.  Raise '
+                        'it to make a given rank act stronger.')
+    p.add_argument('--train-ln', action='store_true', dest='train_ln',
+                   help='also make the vision tower\'s LayerNorm gains/biases '
+                        'trainable (39,936 parameters).  Net() freezes them along with '
+                        'the rest of the backbone, so a LoRA-only run can rescale a '
+                        'sublayer but never re-centre it.  Still parameter-efficient '
+                        'fine-tuning of the official weights (rule 五.2), and it does '
+                        'not change which backbone is built.  Off by default.')
 
     p.add_argument('--local-head', action='store_true', dest='local_head',
                    help='pool the frozen tower\'s final spatial tokens through a tiny '
