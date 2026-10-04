@@ -67,6 +67,12 @@ def load_model(a, device):
     ck_args = ck.get('args', {})
     rank = a.lora_rank or ck.get('lora_rank', ck_args.get('lora_rank', 8))
     target = ck.get('lora_target', ck_args.get('lora_target', 'all'))
+    # same two keys infer.py:214-238 restores: a rebuild that drops them either
+    # discards the checkpoint's attn.qkv.* tensors as *unexpected* or rescales the
+    # adapters to 2*rank instead of the trained alpha, and every number below is
+    # then quietly wrong rather than obviously broken
+    lora_qkv = bool(ck.get('lora_qkv', ck_args.get('lora_qkv', False)))
+    lora_alpha = float(ck.get('lora_alpha', ck_args.get('lora_alpha', 0.0)) or 0.0)
     pretrained = a.pretrained or ck.get('pretrained', 'openai')
     model_name = ck.get('model_name', ck_args.get('model', 'ViT-B-32-quickgelu'))
     T.check_backbone(model_name)
@@ -78,8 +84,14 @@ def load_model(a, device):
     # rebuild the local head too, or its tensors come back as *unexpected*
     # (not missing) and the model silently drops a learned residual
     local_head = bool(ck.get('local_head', ck_args.get('local_head', False)))
-    model = T.Net(clip_model, len(classes), rank, target, local_head=local_head)
-    missing, _ = model.load_state_dict(ck.get('model', ck), strict=False)
+    model = T.Net(clip_model, len(classes), rank, target, local_head=local_head,
+                  lora_qkv=lora_qkv, lora_alpha=lora_alpha)
+    missing, unexpected = model.load_state_dict(ck.get('model', ck), strict=False)
+    # the frozen backbone is absent from a snapshot by design, so `missing` is only
+    # meaningful for trainable names.  `unexpected` never is: it means trained
+    # tensors arrived that this model cannot hold.
+    assert not unexpected, ('checkpoint carries trained weights this model cannot '
+                            f'hold -- rebuilt with the wrong flags? {sorted(unexpected)[:5]}')
     trained = {n for n, p in model.named_parameters() if p.requires_grad}
     lost = trained & set(missing)
     assert not lost, f'checkpoint has no trained weights for: {sorted(lost)[:5]}'
@@ -119,6 +131,13 @@ def report(a):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model, classes, img_size = load_model(a, device)
     ds = build_split(a, a.split, img_size)
+    # `given`/`pred` below are indices into the *dataset's* class ordering, while every
+    # name this report prints comes from the checkpoint's.  If the two tables ever
+    # disagree (wrong --data) the labels are silently shifted and the whole report --
+    # worst classes, confusions, suspected noise -- is confidently wrong.
+    # valmetrics.py:81 guards the same invariant; this file did not.
+    assert ds.class_to_idx == classes, (
+        'the split found a different class list than the checkpoint -- wrong --data?')
     names = {i: n for n, i in classes.items()}
     print(f'{a.split} split: {len(ds)} images')
 

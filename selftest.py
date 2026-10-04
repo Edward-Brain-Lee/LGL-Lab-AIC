@@ -433,6 +433,12 @@ def check_lora_qkv_and_ln():
     with torch.no_grad():
         ref = mha(x, x, x, need_weights=False)[0]
     wrapped = train.LoRAQKVAttention(mha)
+    # LoRAQKVAttention only *rebuilds* the fused projection as a plain nn.Linear;
+    # it is `add_lora` that wraps it into a LoRALinear (train.py:353).  Without this
+    # the assertions below reach for `.base` / `.A` on an nn.Linear and die with an
+    # AttributeError that looks like a train.py bug rather than a test bug.
+    assert train.add_lora(wrapped, rank=4, alpha=8) == 2, \
+        'add_lora must wrap exactly the rebuilt qkv and the existing out_proj'
     wrapped.eval()
     with torch.no_grad():
         got = wrapped(x, x, x, need_weights=False)[0]

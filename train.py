@@ -365,8 +365,9 @@ class LoRAQKVAttention(nn.Module):
         value = key if value is None else value
         # F.multi_head_attention_forward speaks (L, N, E) only; nn.MultiheadAttention
         # does this transpose itself, so it has to be reproduced here to stay a
-        # drop-in.  open_clip builds batch_first=False, but the stub in selftest.py
-        # does not, and neither would a future backbone.
+        # drop-in.  Do not hard-code which way open_clip builds it: the pinned
+        # open_clip_torch 3.3.0 leaves Transformer's batch_first at its default
+        # (True), so this reads it off the module instead of assuming.
         if self.batch_first:
             query, key, value = (t.transpose(0, 1) for t in (query, key, value))
         kw = {'training': self.training, 'key_padding_mask': key_padding_mask,
@@ -1115,7 +1116,7 @@ def parse_args(argv=None):
                         'the trained one and there is nothing to fix.')
     p.add_argument('--img-size', type=int, default=224, dest='img_size',
                    help='input resolution. Must be a multiple of ViT-B/32\'s patch size '
-                        '32: 224, 256, 288, 320, 352. The positional grid is bicubically '
+                        '32: 224, 256, 288, 320, 352, 384, 416. The positional grid is bicubically '
                         'resampled to match (open_clip does not do this itself). '
                         '336 is NOT legal -- it belongs to CLIP ViT-L/14. Training and '
                         'inference must agree; infer.py reads this back from the '

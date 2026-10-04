@@ -83,7 +83,8 @@ def report(path, ck, model, device, a):
         'wrong --data?')
 
     n, acc, rec, per_t = run(model, va, device, a)
-    order = rec.argsort()
+    order = rec.argsort()                   # worst recall first
+    freq_order = per_t.argsort()            # rarest class first (NOT the same thing)
     half, k = len(rec) // 2, max(1, len(rec) // 10)
     rev = {v: kk for kk, v in va.class_to_idx.items()}
 
@@ -92,8 +93,8 @@ def report(path, ck, model, device, a):
     print(f'  macro     class-equal recall            : {float(rec.mean()):.4f}')
     print(f'  per-class val images : min {int(per_t.min())} / max {int(per_t.max())} '
           f'(ratio {int(per_t.max()) / max(int(per_t.min()), 1):.0f}x)')
-    print(f'  recall, rarest 50% of classes : {float(rec[order[:half]].mean()):.4f}')
-    print(f'  recall, commonest 10%         : {float(rec[order[-k:]].mean()):.4f}')
+    print(f'  recall, rarest 50% of classes : {float(rec[freq_order[:half]].mean()):.4f}')
+    print(f'  recall, commonest 10%         : {float(rec[freq_order[-k:]].mean()):.4f}')
     print('  worst 5 classes: ' + ', '.join(
         f'{rev[int(i)]}(n={int(per_t[i])},r={float(rec[i]):.2f})' for i in order[:5]))
 
@@ -105,6 +106,13 @@ def main(a):
         ck_args = ck.get('args', {})
         rank = ck.get('lora_rank', ck_args.get('lora_rank', 8))
         target = ck.get('lora_target', ck_args.get('lora_target', 'all'))
+        # --lora-qkv / --lora-alpha have to come back too, exactly as infer.py:214-238
+        # does it.  Without them a rebuilt Net either has nowhere to put the
+        # checkpoint's attn.qkv.* tensors (they arrive as *unexpected* and are dropped)
+        # or re-derives the adapter scale as 2*rank instead of the trained alpha --
+        # both hand back a wrong val_acc with nothing raised.
+        lora_qkv = bool(ck.get('lora_qkv', ck_args.get('lora_qkv', False)))
+        lora_alpha = float(ck.get('lora_alpha', ck_args.get('lora_alpha', 0.0)) or 0.0)
         model_name = ck.get('model_name', ck_args.get('model', 'ViT-B-32-quickgelu'))
         check_backbone(model_name)
 
@@ -119,8 +127,17 @@ def main(a):
         # rebuild the local head too, or its tensors come back as *unexpected*
         # (not missing) and the model silently drops a learned residual
         local_head = bool(ck.get('local_head', ck_args.get('local_head', False)))
-        model = Net(clip_model, len(ck['classes']), rank, target, local_head=local_head)
-        missing, _ = model.load_state_dict(ck.get('model', ck), strict=False)
+        model = Net(clip_model, len(ck['classes']), rank, target, local_head=local_head,
+                    lora_qkv=lora_qkv, lora_alpha=lora_alpha)
+        missing, unexpected = model.load_state_dict(ck.get('model', ck), strict=False)
+        # `missing` is expected: the snapshot is `trainable_state_dict()`, so the
+        # frozen backbone is deliberately absent and only trainable names matter.
+        # `unexpected` is not expected -- it means the checkpoint carries trained
+        # tensors this Net has nowhere to put, which is exactly what a rebuild that
+        # forgot a new flag looks like.  The old code bound it to `_` and reported a
+        # confidently wrong accuracy instead.
+        assert not unexpected, ('checkpoint carries trained weights this model cannot '
+                                f'hold -- rebuilt with the wrong flags? {sorted(unexpected)[:5]}')
         lost = {n for n, p in model.named_parameters() if p.requires_grad} & set(missing)
         assert not lost, f'no trained weights in checkpoint for: {sorted(lost)[:5]}'
         del clip_model

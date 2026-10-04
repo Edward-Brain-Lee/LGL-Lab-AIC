@@ -246,8 +246,14 @@ def checkpoint_report(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
                        "val_acc": checkpoint.get("val_acc"),
                        "val_acc_hi": checkpoint.get("val_acc_hi"),
                        "model_name": checkpoint.get("model_name"),
-                       "image_size": args.get("image_size"),
-                       "pos_embed_trained": checkpoint.get("pos_embed_trained"),
+                       # BOTH of these were read from the wrong place and so always
+                       # came back null.  train.py spells the resolution `--img-size`
+                       # (dest `img_size`, train.py:1116) and neither key is a
+                       # top-level checkpoint entry -- SNAPSHOT_KEYS carries 'args',
+                       # which is where the real values live.
+                       "image_size": args.get("img_size", args.get("image_size")),
+                       "pos_embed_trained": checkpoint.get("pos_embed_trained",
+                                                           args.get("train_pos_embed")),
                        "config_fingerprint": config_fingerprint(args)},
         "tracker": summarize_tracker(tracker),
     }
