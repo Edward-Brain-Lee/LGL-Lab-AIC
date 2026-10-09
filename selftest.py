@@ -766,8 +766,14 @@ def check_junk_filter():
     # ... and a class whose samples are *all* rejected must not vanish from the
     # decision space: an absent class has a zero centroid, and a zero centroid is a
     # *neutral* competitor, which beats a genuinely anti-correlated real class
+    # The folder has to be split across *two* foreign classes for all twenty to be
+    # rejected at once.  A folder that is uniformly a single other class has a mean
+    # that *is* that class -- class 3's centroid would simply become truth[0], its
+    # members would then sit right on their own centroid, and the guard, which only
+    # fires when a class is left with nothing, would never be exercised at all.
     z_e = z.clone()
-    z_e[60:80] = truth[0] + 0.01 * torch.randn(per, D)   # class 3's folder is all class 0
+    z_e[60:70] = truth[0] + 0.01 * torch.randn(per // 2, D)   # class 3's folder holds
+    z_e[70:80] = truth[1] + 0.01 * torch.randn(per // 2, D)   # class 0 and class 1
     means_e, present_e, keep_e = train.robust_centroids(z_e, y.tolist(), nclass, rounds=2,
                                                        verbose=False)
     assert bool(present_e[3]), 'a class whose samples were all rejected vanished entirely'
@@ -800,9 +806,17 @@ def check_junk_filter():
                               floor=0.2, verbose=False)[1]['flagged'] == 0, \
         'max_frac 0 must be a no-op'
 
-    # 4) dedup keeps the first occurrence of a cluster, and only the first
-    zd = torch.randn(10, D)
-    zd[7] = zd[2]
+    # 4) dedup keeps the first occurrence of a cluster, and only the first.
+    # The rows are built on the 8 axes rather than drawn from torch.randn: at D=8
+    # cos^2 ~ Beta(1/2, (D-1)/2) has a heavy enough tail that two *unrelated* rows of
+    # a random 10x8 draw can cross --junk-dedup-tau, and then the counts below would
+    # be measuring the RNG instead of the rule.  Basis rows make every unrelated pair
+    # exactly 0, so the only pairs above the threshold are the ones planted here.
+    zd = torch.zeros(10, D)
+    zd[torch.arange(8), torch.arange(8)] = 1.0
+    zd[8, :2] = math.sqrt(0.5)                     # (e0 + e1)/sqrt2
+    zd[9, 0], zd[9, 1] = math.sqrt(0.5), -math.sqrt(0.5)
+    zd[7] = zd[2]                                  # index 7 is index 2, verbatim
     wd, rep_d = train.junk_weights(zd, [0] * 10, None, None, mode='dedup',
                                    dedup_tau=0.98, max_frac=1.0, floor=0.2, verbose=False)
     assert rep_d['dup'] == 1, rep_d
