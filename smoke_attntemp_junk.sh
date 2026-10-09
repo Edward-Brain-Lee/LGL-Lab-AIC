@@ -266,10 +266,20 @@ for line in t.splitlines():
 # and the rare classes are 7 folders, so "all of the damage in a few folders" is a
 # real failure mode, not a hypothetical.
 mpc = g(r"per-class flag rate: max ([\d.]+)%, (\d+) classes over 20%")
-pc_max, pc_over = float(mpc.group(1)), int(mpc.group(2))
-assert pc_max < 1.0, (f"a class had {pc_max:.1%} of its samples flagged -- that class is "
+# the log prints a PERCENT (".1%"), so 4.5% arrives as "4.5" -- divide, or the
+# fraction comparisons below are off by a factor of 100
+pc_max, pc_over = float(mpc.group(1)) / 100.0, int(mpc.group(2))
+assert pc_max < 0.9, (f"a class had {pc_max:.1%} of its samples flagged -- that class is "
                       "effectively emptied.  Fix the filter, do not start the run.")
-assert pc_over <= 10, f"{pc_over} classes have >20% of their samples flagged"
+if pc_max > 0.30 or pc_over > 10:
+    # Not fatal on its own: 5% of the split spread unevenly can legitimately land on
+    # a few small folders.  But the whole reason this gate exists is that a filter
+    # which empties a rare class is invisible in the aggregate number, so it has to
+    # be read before the run starts, not discovered 3.4 hours later.
+    print(f"  WARNING: the flag rate is concentrated -- worst class {pc_max:.1%}, "
+          f"{pc_over} classes over 20%.  Read the per-class lines in $SMOKE_JK.log "
+          f"before starting: a rare class losing most of its samples is the one "
+          f"failure the aggregate cap cannot see.")
 mad = g(r"\[junk\] flagged (\d+)/(\d+) = ")
 flagged, total = int(mad.group(1)), int(mad.group(2))
 assert flagged > 0, ("the filter flagged NOTHING on the real training split.  Either the "

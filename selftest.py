@@ -670,7 +670,7 @@ def check_attn_temp():
     # 3) the row scale itself: tau only in the query block, exactly 1.0 over k/v
     scale = wrapped._temp_scale(torch.float32)
     assert scale.shape == (3 * DIM, 1)
-    assert torch.all(torch.equal(scale[DIM:], torch.ones(2 * DIM, 1))), \
+    assert torch.equal(scale[DIM:], torch.ones(2 * DIM, 1)), \
         'the k/v rows must keep a factor of exactly 1.0, they are not touched'
     assert torch.allclose(scale[:DIM, 0], taus.repeat_interleave(head_dim)), \
         'tau was not applied per head across the query rows'
@@ -793,7 +793,9 @@ def check_junk_filter():
     assert rep_cap['flagged'] == int(0.05 * len(yy)) == 2, rep_cap
     assert rep_cap['cap_bound'] is True, 'the cap bound and did not report it'
     assert int((w_cap < 1).sum()) == 2
-    assert float(w_cap.min()) == 0.2, 'a flagged sample did not get --junk-floor'
+    # abs(), not ==: the weights are float32 and float(tensor(0.2)) is
+    # 0.20000000298..., so an exact comparison is a guaranteed failure.
+    assert abs(float(w_cap.min()) - 0.2) < 1e-6, 'a flagged sample did not get --junk-floor'
     assert train.junk_weights(zz, yy, truth, present, mode='margin', max_frac=0.0,
                               floor=0.2, verbose=False)[1]['flagged'] == 0, \
         'max_frac 0 must be a no-op'
@@ -804,7 +806,8 @@ def check_junk_filter():
     wd, rep_d = train.junk_weights(zd, [0] * 10, None, None, mode='dedup',
                                    dedup_tau=0.98, max_frac=1.0, floor=0.2, verbose=False)
     assert rep_d['dup'] == 1, rep_d
-    assert float(wd[7]) == 0.2 and float(wd[2]) == 1.0, 'dedup did not keep the first copy'
+    assert abs(float(wd[7]) - 0.2) < 1e-6 and float(wd[2]) == 1.0, \
+        'dedup did not keep the first copy'
     assert rep_d['dup_cross'] == 0.0
     # a duplicate outranks a margin flag when the cap binds.  This is arithmetic, not
     # a preference: the margin term is normalised into [0, 1] and a duplicate adds 2,
@@ -828,7 +831,18 @@ def check_junk_filter():
             d.mkdir(parents=True)
             for i in range(5):
                 px = bytes(random.randrange(256) for _ in range(48 * 48 * 3))
-                Image.frombytes('RGB', (48, 48), px).save(d / f'img_{c}_{i}.jpg')
+                im = Image.frombytes('RGB', (48, 48), px)
+                im.save(d / f'img_{c}_{i}.jpg')
+                if c == 0 and i == 0:
+                    # Three pixel-identical copies inside class 0.  Exactly one file of
+                    # each class can land in the val split, so at least three of these
+                    # four end up in the training split and at least two of them have a
+                    # prior copy -- the dedup rule is then *guaranteed* to fire.  Without
+                    # this the end-to-end weight-floor check below hinges on whether
+                    # random 48x48 noise happens to produce a positive margin, i.e. on a
+                    # coin flip that a stubbed tower gives no way to predict.
+                    for k in range(3):
+                        im.save(d / f'img_{c}_copy{k}.jpg')
         a = train.parse_args(['--data', str(root), '--workers', '0', '--amp', 'none'])
         ds = train.ImageFolderNoisy(a.data, train.eval_transform(a), False, a.val_ratio,
                                     a.seed, 'train', a.img_size)
@@ -855,7 +869,8 @@ def check_junk_filter():
         assert ck['junk_report'] is not None and ck['junk_report']['mode'] == 'both'
         n_tr = len(train.build_datasets(train.parse_args(run))[0])
         assert ck['junk_w'].shape == (n_tr,), (ck['junk_w'].shape, n_tr)
-        assert float(ck['junk_w'].min()) == 0.1 and float(ck['junk_w'].max()) == 1.0
+        assert abs(float(ck['junk_w'].min()) - 0.1) < 1e-6 and \
+            float(ck['junk_w'].max()) == 1.0
         # resuming the filterless way must stop the run rather than silently drop them
         args = train.parse_args(['--data', str(root), '--out', str(tmp / 'out2'),
                                  '--resume', str(out / 'last.pt')])
