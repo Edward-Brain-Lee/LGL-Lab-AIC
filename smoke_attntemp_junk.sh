@@ -276,6 +276,12 @@ mpc = g(r"per-class flag rate: max ([\d.]+)%, (\d+) classes over 20%")
 # points, and 25 classes above 20% is worth at most a few tenths of a board point
 # in the absurd case where every one of them is gutted.  What *is* fatal is the
 # aggregate leaving its bound (asserted above) or a class disappearing outright.
+if mpc is None:
+    # the substring check above only proves the words are there; a changed format
+    # would otherwise surface as a bare AttributeError and cost another 15-minute
+    # round trip on the box.
+    print("SMOKE FAIL: the per-class line is not in the expected format:",
+          [l.strip() for l in t.splitlines() if "per-class" in l]); sys.exit(1)
 pc_max, pc_over = float(mpc.group(1)) / 100.0, int(mpc.group(2))
 if pc_max > 0.30 or pc_over > 10:
     print(f"  WARNING: the flag rate is concentrated -- worst class {pc_max:.1%}, "
