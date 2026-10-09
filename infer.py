@@ -213,6 +213,11 @@ def main(a):
     # frozen predictions
     lora_qkv = bool(ck.get('lora_qkv', ck_args.get('lora_qkv', False)))
     lora_alpha = float(ck.get('lora_alpha', ck_args.get('lora_alpha', 0.0)) or 0.0)
+    # --attn-temp adds per-head temperatures to the rebuilt attention block, so the
+    # architecture has to be rebuilt with it too: without this the rho tensors are
+    # simply absent from the load and the `lost` assertion below would be the only
+    # thing between that and an inference run with no temperature at all
+    attn_temp = bool(ck.get('attn_temp', ck_args.get('attn_temp', False)))
     # --train-ln needs no rebuild (the LayerNorms are part of the tower either way and
     # load by name); it is read back only to say in the log which recipe this is
     train_ln = bool(ck.get('train_ln', ck_args.get('train_ln', False)))
@@ -235,8 +240,10 @@ def main(a):
         grid = resize_positional_embedding(clip_model.visual, img_size)
         print(f'img_size={img_size}: positional grid resampled to {grid}x{grid}')
     model = Net(clip_model, len(classes), rank, target, local_head=local_head,
-                lora_qkv=lora_qkv, lora_alpha=lora_alpha)
-    missing, _ = model.load_state_dict(ck.get('model', ck), strict=False)
+                lora_qkv=lora_qkv, lora_alpha=lora_alpha, attn_temp=attn_temp)
+    missing, unexpected = model.load_state_dict(ck.get('model', ck), strict=False)
+    assert not unexpected, ('checkpoint carries trained weights this model cannot hold: '
+                            f'{sorted(unexpected)[:5]}')
     trained = {n for n, p in model.named_parameters() if p.requires_grad}
     lost = trained & set(missing)
     assert not lost, f'checkpoint has no trained weights for: {sorted(lost)[:5]}'
@@ -244,7 +251,13 @@ def main(a):
     model.to(device).eval()
     print(f'loaded {a.checkpoint} (epoch {ck.get("epoch", "?")}, '
           f'{len(classes)} classes, {model_name}, lora rank {rank}/{target}'
-          f'{", qkv" if lora_qkv else ""}{", train-ln" if train_ln else ""})')
+          f'{", qkv" if lora_qkv else ""}{", train-ln" if train_ln else ""}'
+          f'{", attn-temp" if attn_temp else ""})')
+    if attn_temp:
+        tau = model.attn_temperature()
+        print(f'attention temperature: {tau.numel()} heads, '
+              f'min={float(tau.min()):.4f} mean={float(tau.mean()):.4f} '
+              f'max={float(tau.max()):.4f}')
 
     # folder name -> four-digit submission label
     idx_to_label = {}

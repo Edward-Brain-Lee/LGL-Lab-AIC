@@ -104,6 +104,98 @@ import infer  # noqa: E402
 import losses  # noqa: E402
 import noise  # noqa: E402
 import train  # noqa: E402
+import checkpoint_search  # noqa: E402
+import json
+from semantic_regularization import semantic_cost, expected_semantic_cost
+from build_semantic_reference import split_fingerprint
+
+
+def check_class_regularisation():
+    counts = [4, 40, 200, 200]
+    weights = train.make_class_loss_weights(counts, .25, .75, 1.5)
+    assert .75 <= weights.min() <= weights.max() <= 1.5
+    assert weights[0] > weights[-1]
+    assert torch.equal(train.make_class_loss_weights(counts), torch.ones(4))
+    margins = train.class_margins(counts, .5, .25)
+    assert margins[0] == .5 and margins[0] > margins[-1]
+    out = torch.tensor([[1., 2., 0.], [3., 0., 1.]], requires_grad=True)
+    loss = train.class_margin_loss(out, torch.tensor([0, 0]), torch.tensor([.5, .2]))
+    assert torch.allclose(loss, torch.tensor([1.5, 0.]))
+    loss.sum().backward()
+    # Active margin raises the given logit and lowers its strongest rival.
+    assert out.grad[0, 0] < 0 and out.grad[0, 1] > 0
+    assert torch.equal(out.grad[1], torch.zeros(3))
+    assert torch.equal(train.class_margin_loss(out.detach(), torch.tensor([0, 0])), torch.zeros(2))
+    print('  class weights / bounded margin gradients ok')
+
+
+def check_fixed_anchor_and_consistency():
+    class SensitiveVisual(_StubVisual):
+        def forward(self, x):
+            z = super().forward(x)
+            return z + self.positional_embedding[0][None, :]
+
+    clip = _StubCLIP()
+    clip.visual = SensitiveVisual()
+    net = train.Net(clip, 4, 4, 'all')
+    train.enable_pos_embed_training(net)
+    train.enable_ln_training(net)
+    net.freeze_anchor_reference()
+    x = torch.randn(3, 12)
+    reference = net.anchor_feat(x)
+    with torch.no_grad():
+        net.clip.visual.positional_embedding.add_(torch.randn_like(net.clip.visual.positional_embedding))
+        for mod in net.clip.visual.modules():
+            if isinstance(mod, nn.LayerNorm):
+                mod.bias.add_(.3)
+            if isinstance(mod, train.LoRALinear):
+                mod.B.normal_(std=.1)
+    current_pe = net.clip.visual.positional_embedding.detach().clone()
+    assert torch.allclose(net.anchor_feat(x), reference, atol=1e-6)
+    assert torch.equal(net.clip.visual.positional_embedding, current_pe)
+    assert not any(k.startswith('_anchor_reference') for k in net.trainable_state_dict())
+    net(x).sum().backward()
+    assert net.clip.visual.positional_embedding.grad is not None
+    assert net.clip.visual.positional_embedding.grad.norm() > 0
+    assert net.clip.visual.training, 'anchor changed student training mode'
+    z1, z2 = torch.randn(3, 32, requires_grad=True), torch.randn(3, 32, requires_grad=True)
+    u, v = F.normalize(z1, dim=-1), F.normalize(z2, dim=-1)
+    cos = train.view_consistency(u, v, 'cosine')
+    assert torch.allclose(cos, train.view_consistency(v, u, 'cosine'))
+    assert torch.allclose(train.view_consistency(u, v, 'mse') * 16, cos, atol=1e-6)
+    cos.backward()
+    assert z1.grad.norm() > 0 and z2.grad.norm() > 0
+    print('  fixed PE/LayerNorm anchor, restoration and symmetric consistency gradients ok')
+
+
+def check_semantic_regularisation():
+    prototypes = torch.tensor([[1., 0.], [.8, .6], [-1., 0.]])
+    cost = semantic_cost(prototypes)
+    assert cost[0, 0] == 0 and cost[0, 1] < cost[0, 2]
+    close = torch.tensor([[0., 5., 0.]])
+    far = torch.tensor([[0., 0., 5.]], requires_grad=True)
+    target = torch.tensor([0])
+    assert expected_semantic_cost(close, target, cost) < expected_semantic_cost(far, target, cost)
+    expected_semantic_cost(far, target, cost).sum().backward()
+    assert far.grad[0, 2] > 0 and far.grad[0, 0] < 0
+    soft = F.one_hot(target, 3).float()
+    assert torch.equal(expected_semantic_cost(close, target, cost), expected_semantic_cost(close, soft, cost))
+    print('  semantic costs: nearby/far mistakes, soft targets and gradients ok')
+
+
+def check_search_optimizer_groups():
+    net = train.Net(_StubCLIP(), 4, 4, 'all')
+    train.enable_pos_embed_training(net)
+    train.enable_ln_training(net)
+    groups = train.optimizer_groups(net, .05, 'no_decay_small')
+    decay = {id(p) for p in groups[0]['params']}
+    no_decay = {id(p) for p in groups[1]['params']}
+    assert not decay & no_decay
+    assert decay | no_decay == {id(p) for p in net.parameters() if p.requires_grad}
+    assert id(net.head.logit_scale) in no_decay
+    assert id(net.clip.visual.positional_embedding) in no_decay
+    assert id(net.head.weight) in decay
+    print('  optimizer groups partition trainables and preserve official frozen parameters ok')
 
 
 def check_losses():
@@ -510,6 +602,274 @@ def check_lora_qkv_and_ln():
     print('  lora-qkv / lora-alpha / train-ln ok')
 
 
+def check_attn_temp():
+    """``--attn-temp``: a per-head softmax temperature that starts as an exact no-op.
+
+    The whole value of this flag is that step 0 is *bit-for-bit* the run without it,
+    so "is it a clean single variable" is the first thing asserted.  The second is
+    that ``tau`` really is a softmax temperature -- i.e. that scaling a head's query
+    rows by ``tau_h`` is equivalent to scaling that head's logits, proved against an
+    ``nn.MultiheadAttention`` whose ``in_proj_weight`` was edited by hand.  The third
+    is the failure this project cares about most: ``anchor_feat`` means "the frozen
+    official tower", so a live temperature there would make the anchor drift silently
+    and poison every statistic derived from it.
+    """
+    torch.manual_seed(0)
+
+    # 1) the flag must be a single variable at step 0: the exact same tensor, not merely
+    #    a close one.  `got` and `got_off` go through the identical functional path and
+    #    the identical frozen weights, so any difference at all would be tau's doing
+    #    (`rho == 0` -> `tau == 1` -> `w * 1.0`, which is exact in floating point).
+    mha = nn.MultiheadAttention(DIM, 4, batch_first=True)
+    x = torch.randn(3, 5, DIM)
+    with torch.no_grad():
+        ref = mha(x, x, x, need_weights=False)[0]
+    wrapped = train.LoRAQKVAttention(mha, attn_temp=True)
+    assert train.add_lora(wrapped, rank=4, alpha=8) == 2, \
+        'add_lora must wrap exactly the rebuilt qkv and the existing out_proj'
+    wrapped.eval()
+    plain = train.LoRAQKVAttention(mha, attn_temp=False)
+    train.add_lora(plain, rank=4, alpha=8)
+    plain.eval()
+    with torch.no_grad():
+        got = wrapped(x, x, x, need_weights=False)[0]
+        got_off = plain(x, x, x, need_weights=False)[0]
+    assert torch.allclose(ref, got, atol=1e-6), \
+        'LoRAQKVAttention(attn_temp=True) is not identical to the attention it replaces at init'
+    assert torch.equal(got, got_off), \
+        '--attn-temp is not bit-for-bit the run without it at step 0'
+    assert wrapped.attn_rho.shape == (4,), \
+        f'rho must be one scalar per head, got {tuple(wrapped.attn_rho.shape)}'
+
+    # 2) tau must act as a per-head temperature on the logits.  tau_h multiplies head
+    #    h's query rows of the fused projection; the functional path then applies one
+    #    global 1/sqrt(head_dim), so the logits scale by exactly tau_h.  Checking it
+    #    against an MHA with a hand-scaled in_proj_weight is what makes this a test of
+    #    the semantics rather than of the plumbing.  (atol 1e-5 not 1e-6: the plain MHA
+    #    may take torch's fused SDPA path, which differs from the functional one by
+    #    rounding alone -- see the atol=1e-6 on `ref` above for the same reason.)
+    taus = torch.tensor([0.5, 1.0, 2.0, 3.0])
+    head_dim = DIM // 4
+    with torch.no_grad():
+        w = wrapped.qkv.weight.clone()
+        manual = w.clone()
+        manual[:DIM] = (w[:DIM].view(4, head_dim, DIM) * taus[:, None, None]).reshape(DIM, DIM)
+        wrapped.attn_rho.copy_(taus.log())
+        got_tau = wrapped(x, x, x, need_weights=False)[0]
+
+        ref_mha = nn.MultiheadAttention(DIM, 4, batch_first=True)
+        ref_mha.in_proj_weight.copy_(manual)
+        ref_mha.in_proj_bias.copy_(mha.in_proj_bias)
+        ref_mha.out_proj.weight.copy_(mha.out_proj.weight)
+        ref_mha.out_proj.bias.copy_(mha.out_proj.bias)
+        want = ref_mha(x, x, x, need_weights=False)[0]
+    assert not torch.allclose(ref, got_tau, atol=1e-4), 'a non-unit tau changed nothing'
+    assert torch.allclose(got_tau, want, atol=1e-5), \
+        'tau is not a per-head scaling of the query rows'
+
+    # 3) the row scale itself: tau only in the query block, exactly 1.0 over k/v
+    scale = wrapped._temp_scale(torch.float32)
+    assert scale.shape == (3 * DIM, 1)
+    assert torch.all(torch.equal(scale[DIM:], torch.ones(2 * DIM, 1))), \
+        'the k/v rows must keep a factor of exactly 1.0, they are not touched'
+    assert torch.allclose(scale[:DIM, 0], taus.repeat_interleave(head_dim)), \
+        'tau was not applied per head across the query rows'
+
+    # 4) --attn-temp needs the rebuilt block even without --lora-qkv, rho must survive
+    #    Net's blanket freeze of the backbone, and nothing may appear when it is off
+    off = train.Net(_StubCLIP(), 4, 4, 'all')
+    assert off.attn_temp is False and off.attn_temperature() is None
+    assert not any(isinstance(m, train.LoRAQKVAttention) for m in off.clip.visual.modules())
+    assert not any(k.endswith('attn_rho') for k in off.state_dict())
+
+    clip_t = _StubCLIP()
+    net_t = train.Net(clip_t, 4, 4, 'all', attn_temp=True)
+    assert not any(isinstance(m, nn.MultiheadAttention) for m in net_t.clip.visual.modules()), \
+        '--attn-temp did not replace the attention block, so it has nowhere to live'
+    assert net_t.n_lora == off.n_lora + 1, \
+        f'--attn-temp wrapped {net_t.n_lora - off.n_lora} layers, want 1 (the qkv projection)'
+    attn = net_t.clip.visual.block.attn
+    assert attn.attn_rho.requires_grad, \
+        'Net froze rho along with the backbone -- the flag would silently do nothing'
+    assert net_t.attn_temperature().numel() == 4, 'one temperature per head'
+
+    # 5) the anchor is the frozen tower.  A tau only matters when there is more than
+    #    one key to reweight -- the stub tower emits a single token, whose softmax is
+    #    identically 1 regardless of temperature -- so the live-vs-frozen comparison is
+    #    made on the attention module directly, and only the invariance is asserted at
+    #    the model level.  If the temperature leaked into anchor_feat, prototype
+    #    bootstrap and the junk filter would both read features that drift with rho.
+    h = torch.randn(2, 5, DIM)
+    xt = torch.randn(3, 12)
+    with torch.no_grad():
+        attn.attn_rho.zero_()
+        eq = attn(h, h, h, need_weights=False)[0]
+        base_feat = F.normalize(clip_t.visual(xt), dim=-1)
+        attn.attn_rho.fill_(1.0)                      # tau = e for every head
+        live = attn(h, h, h, need_weights=False)[0]
+        assert not torch.allclose(live, eq, atol=1e-5), \
+            'tau = e changed nothing: the temperature never reaches the forward pass'
+        assert torch.allclose(net_t.anchor_feat(xt), base_feat, atol=1e-6), \
+            'anchor_feat is no longer the frozen tower: the temperature leaked into it'
+        with train.lora_disabled(net_t.clip.visual):
+            frozen = attn(h, h, h, need_weights=False)[0]
+        assert torch.allclose(frozen, eq, atol=1e-6), \
+            'lora_disabled did not restore the frozen attention'
+        assert attn.temp_enabled is True
+        with train.lora_disabled(net_t.clip.visual):
+            assert attn.temp_enabled is False, 'lora_disabled left the temperature on'
+        assert attn.temp_enabled is True, 'lora_disabled did not restore the temperature'
+
+    # 6) checkpoint round trip, and the *metadata* path the flag also travels on:
+    #    --resume reads it from the raw dict, infer.py from the same key, and thin()
+    #    silently drops anything missing from SNAPSHOT_KEYS -- which would turn every
+    #    --attn-temp checkpoint back into a plain one with nothing in the log.
+    assert 'attn_temp' in train.SNAPSHOT_KEYS, \
+        'thin() would drop attn_temp: infer.py would rebuild the model without rho'
+    assert net_t.attn_temp is True and off.attn_temp is False
+    sd = net_t.trainable_state_dict()
+    assert any(k.endswith('attn_rho') for k in sd), 'rho is not checkpointed'
+    fresh = train.Net(_StubCLIP(), 4, 4, 'all', attn_temp=True)
+    fresh.load_state_dict(sd, strict=False)
+    assert torch.equal(fresh.clip.visual.block.attn.attn_rho, attn.attn_rho), \
+        'rho did not survive the checkpoint round trip'
+    print('  attn-temp ok')
+
+
+def check_junk_filter():
+    """``--junk-filter``: frozen-tower screening of 杂图 and near-duplicates.
+
+    Three things have to hold, and none of them is visible from a log line: the
+    robust centroids must actually drop the mislabelled samples (otherwise the
+    margin rule is comparing against a centroid the noise built), the cap must bound
+    the filter rather than decorate it, and the frozen pass must attach row ``i`` to
+    training index ``i`` -- a permutation there would reweight the *wrong* images and
+    every downstream number would still look perfectly plausible.
+    """
+    torch.manual_seed(0)
+
+    # 1) robust centroids: a quarter of class 0's samples carry class 1's label
+    nclass, per, D = 4, 20, 8
+    truth = F.normalize(torch.randn(nclass, D), dim=-1)
+    z = truth.repeat_interleave(per, 0) + 0.01 * torch.randn(nclass * per, D)
+    y = torch.arange(nclass).repeat_interleave(per)
+    y[:4] = 1                                     # 4 of class 0's samples say "class 1"
+    means, present, keep = train.robust_centroids(z, y.tolist(), nclass, rounds=2, verbose=False)
+    assert bool(present.all()), 'a class with 20 samples came back absent'
+    naive = F.normalize(torch.stack([z[y == c].mean(0) for c in range(nclass)]), dim=-1)
+    got = float((F.normalize(means, dim=-1) * truth).sum(1).mean())
+    assert got > float((naive * truth).sum(1).mean()), \
+        'the robust round did not improve the centroids over the plain folder mean'
+    assert not bool(keep[:4].any()), 'the mislabelled samples survived the centroid round'
+    assert int(keep.sum()) == nclass * per - 4, f'{int(keep.sum())} kept, want {nclass * per - 4}'
+
+    # ... and a class whose samples are *all* rejected must not vanish from the
+    # decision space: an absent class has a zero centroid, and a zero centroid is a
+    # *neutral* competitor, which beats a genuinely anti-correlated real class
+    z_e = z.clone()
+    z_e[60:80] = truth[0] + 0.01 * torch.randn(per, D)   # class 3's folder is all class 0
+    means_e, present_e, keep_e = train.robust_centroids(z_e, y.tolist(), nclass, rounds=2,
+                                                       verbose=False)
+    assert bool(present_e[3]), 'a class whose samples were all rejected vanished entirely'
+    assert bool(keep_e[60:80].all()), 'the never-empty rule did not keep the rejected class'
+
+    # 2) the margin rule flags exactly the samples a different centroid describes
+    clean = truth.repeat_interleave(10, 0)        # sits exactly on its own centroid
+    junk = truth[[1, 2, 3]]                       # labelled 0/1/2, is really 1/2/3
+    zz = torch.cat([clean, junk])
+    yy = torch.arange(nclass).repeat_interleave(10).tolist() + [0, 1, 2]
+    present = torch.ones(nclass, dtype=torch.bool)
+    w, rep = train.junk_weights(zz, yy, truth, present, mode='margin', max_frac=1.0,
+                                floor=0.2, verbose=False)
+    assert rep['judged'] == len(yy), 'every class has a centroid, so nothing may be unjudged'
+    assert rep['flagged'] == 3 and rep['margin_pos'] == 3, rep
+    assert bool((w[-3:] == 0.2).all()) and bool((w[:-3] == 1.0).all()), \
+        'the margin rule did not flag exactly the three cross-class images'
+
+    # 3) the cap is the control: with max_frac below the offender count, only the
+    #    most extreme are touched and the run says so
+    w_cap, rep_cap = train.junk_weights(zz, yy, truth, present, mode='margin',
+                                        max_frac=0.05, floor=0.2, verbose=False)
+    assert rep_cap['flagged'] == int(0.05 * len(yy)) == 2, rep_cap
+    assert rep_cap['cap_bound'] is True, 'the cap bound and did not report it'
+    assert int((w_cap < 1).sum()) == 2
+    assert float(w_cap.min()) == 0.2, 'a flagged sample did not get --junk-floor'
+    assert train.junk_weights(zz, yy, truth, present, mode='margin', max_frac=0.0,
+                              floor=0.2, verbose=False)[1]['flagged'] == 0, \
+        'max_frac 0 must be a no-op'
+
+    # 4) dedup keeps the first occurrence of a cluster, and only the first
+    zd = torch.randn(10, D)
+    zd[7] = zd[2]
+    wd, rep_d = train.junk_weights(zd, [0] * 10, None, None, mode='dedup',
+                                   dedup_tau=0.98, max_frac=1.0, floor=0.2, verbose=False)
+    assert rep_d['dup'] == 1, rep_d
+    assert float(wd[7]) == 0.2 and float(wd[2]) == 1.0, 'dedup did not keep the first copy'
+    assert rep_d['dup_cross'] == 0.0
+    # a duplicate outranks a margin flag when the cap binds.  This is arithmetic, not
+    # a preference: the margin term is normalised into [0, 1] and a duplicate adds 2,
+    # so no margin score can ever outrank one.
+    zc = torch.cat([zd, zd[2:3]])                 # index 10 duplicates index 2 as well
+    yc = [0] * 10 + [1]
+    wc, rep_c = train.junk_weights(zc, yc, truth, present, mode='both', dedup_tau=0.98,
+                                   max_frac=0.1, floor=0.2, verbose=False)
+    assert rep_c['dup'] == 2, rep_c                 # indices 7 and 10
+    assert rep_c['flagged'] == 1 and rep_c['cap_bound'] is True, rep_c
+    assert int((wc < 1).nonzero().flatten()[0]) in (7, 10), \
+        'the cap preferred a margin flag over a duplicate'
+
+    # 5) the frozen pass must be a full-coverage, index-aligned sweep
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        root = tmp / 'train'
+        random.seed(0)
+        for c in range(4):
+            d = root / f'{c:04d}'
+            d.mkdir(parents=True)
+            for i in range(5):
+                px = bytes(random.randrange(256) for _ in range(48 * 48 * 3))
+                Image.frombytes('RGB', (48, 48), px).save(d / f'img_{c}_{i}.jpg')
+        a = train.parse_args(['--data', str(root), '--workers', '0', '--amp', 'none'])
+        ds = train.ImageFolderNoisy(a.data, train.eval_transform(a), False, a.val_ratio,
+                                    a.seed, 'train', a.img_size)
+        net = train.Net(_StubCLIP(), 4, 4, 'all')
+        feat, seen = train.frozen_feature_pass(net, ds, torch.device('cpu'), None, False,
+                                               batch_size=4, workers=0, every=0)
+        assert bool(seen.all()), 'the frozen pass left samples unjudged'
+        assert feat.shape == (len(ds), net.head.weight.shape[-1]), feat.shape
+        with torch.no_grad():
+            ref = net.anchor_feat(torch.stack([ds[i][0] for i in range(len(ds))]))
+        assert torch.allclose(feat, ref, atol=1e-5), \
+            'row i of the frozen pass is not training index i'
+
+        # 6) end to end: the filter runs, travels in the checkpoint, and refuses to be
+        #    resumed with a different setting
+        out = tmp / 'out'
+        run = ['--data', str(root), '--out', str(out), '--epochs', '2', '--warmup-epochs', '1',
+               '--batch-size', '4', '--workers', '0', '--val-ratio', '0.25', '--seed', '0',
+               '--amp', 'none', '--junk-filter', 'both', '--junk-max-frac', '0.2',
+               '--junk-floor', '0.1']
+        train.main(train.parse_args(run))
+        ck = torch.load(out / 'best.pt', map_location='cpu', weights_only=False)
+        assert ck['junk_w'] is not None, 'the junk weights are not in the checkpoint'
+        assert ck['junk_report'] is not None and ck['junk_report']['mode'] == 'both'
+        n_tr = len(train.build_datasets(train.parse_args(run))[0])
+        assert ck['junk_w'].shape == (n_tr,), (ck['junk_w'].shape, n_tr)
+        assert float(ck['junk_w'].min()) == 0.1 and float(ck['junk_w'].max()) == 1.0
+        # resuming the filterless way must stop the run rather than silently drop them
+        args = train.parse_args(['--data', str(root), '--out', str(tmp / 'out2'),
+                                 '--resume', str(out / 'last.pt')])
+        try:
+            train.main(args)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError('--resume dropped the junk weights without a word')
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print('  junk-filter ok')
+
+
 def check_pos_embed_resize():
     """--img-size: the shape maths a two-hour run depends on, checked in a second.
 
@@ -657,6 +1017,15 @@ def check_end_to_end():
         both = tr_paths & va_paths
         assert not both, f'{len(both)} images are in BOTH the train and the val split'
         assert len(tr_paths) + len(va_paths) == 32, (len(tr_paths), len(va_paths))
+        split_a = train.parse_args(['--data', str(root), '--seed', '1234', '--split-seed', '0',
+                                    '--val-ratio', '.25'])
+        _, same_va = train.build_datasets(split_a)
+        assert {p for p, _ in same_va.items} == va_paths
+        shuffle_a = train.parse_args(['--data', str(root), '--workers', '0', '--sampler', 'shuffle',
+                                      '--batch-size', '4'])
+        shuffle_loader, _ = train.build_loaders(shuffle_a, tr_ds, va_ds)
+        drawn = list(shuffle_loader.sampler)
+        assert len(drawn) == len(set(drawn)) == len(tr_ds)
 
         train.main(a)
         assert (out / 'best.pt').exists() and (out / 'last.pt').exists(), 'no checkpoint written'
@@ -694,12 +1063,24 @@ def check_end_to_end():
         # checkpoint whose extra adapters never reached the file -- or never came back
         # out of it -- which looks exactly like a normal run right up to the submission.
         out2 = tmp / 'out2'
+        semantic_path = tmp / 'semantic.pt'
+        torch.save(dict(provenance='official-training-only', backbone='ViT-B-32-quickgelu',
+                        pretrained='openai',
+                        classes=tr_ds.class_to_idx, train_fingerprint=split_fingerprint(tr_ds),
+                        counts=torch.tensor([6, 6, 6, 6]),
+                        prototypes=F.normalize(torch.randn(4, DIM), dim=-1)), semantic_path)
         train.main(train.parse_args(['--data', str(root), '--out', str(out2),
                                      '--epochs', '2', '--warmup-epochs', '1',
                                      '--batch-size', '4', '--workers', '0',
                                      '--val-ratio', '0.25', '--seed', '0', '--amp', 'none',
                                      '--lora-rank', '4', '--lora-alpha', '8',
-                                     '--lora-qkv', '--train-ln']))
+                                     '--lora-qkv', '--train-ln', '--save-teacher',
+                                     '--train-pos-embed', '--fixed-anchor', '--consistency-mode', 'cosine',
+                                     '--class-weight-beta', '0.25', '--class-margin', '0.5',
+                                     '--class-margin-power', '0.25', '--class-margin-conf', '0',
+                                     '--semantic-reference', str(semantic_path), '--semantic-weight', '.05',
+                                     '--semantic-conf', '0',
+                                     '--select', 'val_macro']))
         ck2 = torch.load(out2 / 'best.pt', map_location='cpu', weights_only=False)
         assert ck2['lora_qkv'] is True and ck2['train_ln'] is True, sorted(ck2)
         assert ck2['lora_alpha'] == 8, ck2['lora_alpha']
@@ -707,12 +1088,71 @@ def check_end_to_end():
             'the qkv adapter did not survive into the checkpoint'
         assert any('norm.weight' in k for k in ck2['model']), \
             'the trained LayerNorm did not survive into the checkpoint'
+        assert (out2 / 'teacher_last.pt').exists()
+        assert (out2 / 'val_classes_ep2.csv').exists()
+        assert ck2['args']['class_weight_beta'] == .25
+        assert ck2['args']['class_margin_power'] == .25
         csv_qkv = tmp / 'pred_qkv.csv'
         infer.main(infer.parse_args(['--test', str(root), '--checkpoint', str(out2 / 'best.pt'),
                                      '--output', str(csv_qkv), '--workers', '0']))
         rows_qkv = list(csv.reader(csv_qkv.open()))
         assert len(rows_qkv) == 32, f'--lora-qkv lost rows: {len(rows_qkv)}'
         print('  lora-qkv / train-ln end-to-end ok')
+
+        search_out = tmp / 'search'
+        checkpoint_search.main(checkpoint_search.parse_args([
+            '--checkpoints', str(out2 / 'best.pt'), '--data', str(root),
+            '--recipes', 'plain', '--taus', '0', '.25', '--workers', '0',
+            '--batch-size', '4', '--out', str(search_out)]))
+        selection = json.loads((search_out / 'selection.json').read_text())
+        assert selection['provenance'] == 'official-training-holdout'
+        assert len(selection['candidates']) == 2
+        reference = Path(selection['winner']['reference'])
+        assert len(list(csv.reader(reference.open()))) == len(va_ds)
+        assert {r[0] for r in csv.reader(reference.open())} == {Path(p).name for p in va_paths}
+        print('  checkpoint search uses the disjoint training hold-out ok')
+        original_collect, original_load = checkpoint_search.collect, analyze.load_model
+        def forbidden_forward(*args, **kwargs):
+            raise AssertionError('cached tau search repeated a model load or forward')
+        checkpoint_search.collect = analyze.load_model = forbidden_forward
+        try:
+            checkpoint_search.main(checkpoint_search.parse_args([
+                '--checkpoints', str(out2 / 'best.pt'), '--data', str(root),
+                '--recipes', 'plain', '--taus', '0', '.5', '--workers', '0',
+                '--batch-size', '4', '--out', str(search_out)]))
+        finally:
+            checkpoint_search.collect, analyze.load_model = original_collect, original_load
+        cache_path = next((search_out / 'logits_cache').glob('*.npz'))
+        import numpy as np
+        with np.load(cache_path, allow_pickle=False) as cache:
+            payload = {k: cache[k] for k in cache.files}
+        payload['logits'] = payload['logits'].copy()
+        payload['logits'][0, 0] += 1
+        np.savez(cache_path, **payload)
+        try:
+            checkpoint_search.main(checkpoint_search.parse_args([
+                '--checkpoints', str(out2 / 'best.pt'), '--data', str(root),
+                '--recipes', 'plain', '--taus', '0', '--workers', '0',
+                '--batch-size', '4', '--out', str(search_out)]))
+        except ValueError as error:
+            assert 'payload digest' in str(error)
+        else:
+            raise AssertionError('corrupted logits cache was reused')
+        print('  cached tau search skips inference and rejects corrupt payloads ok')
+
+        # The submission path must fail on extra trained weights, rather than
+        # silently dropping a model component and producing a plausible score.
+        broken = dict(ck2)
+        broken['model'] = dict(ck2['model'], unexpected_trained_weight=torch.ones(1))
+        broken_path = tmp / 'broken.pt'
+        torch.save(broken, broken_path)
+        try:
+            infer.main(infer.parse_args(['--test', str(root), '--checkpoint', str(broken_path),
+                                         '--output', str(tmp / 'broken.csv'), '--workers', '0']))
+        except AssertionError as error:
+            assert 'cannot hold' in str(error)
+        else:
+            raise AssertionError('inference silently dropped a trained tensor')
 
         # several taus must come out of ONE forward pass, one CSV each
         infer.main(infer.parse_args(['--test', str(root), '--checkpoint', str(out / 'best.pt'),
@@ -791,9 +1231,15 @@ if __name__ == '__main__':
     check_losses()
     check_tracker()
     check_targets()
+    check_class_regularisation()
+    check_fixed_anchor_and_consistency()
+    check_semantic_regularisation()
+    check_search_optimizer_groups()
     check_proto()
     check_lora()
     check_lora_qkv_and_ln()
+    check_attn_temp()
+    check_junk_filter()
     check_pos_embed_resize()
     check_train_pos_embed()
     check_img_size_transforms()

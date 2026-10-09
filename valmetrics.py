@@ -76,8 +76,11 @@ def report(path, ck, model, device, a):
     val_tf = transforms.Compose([
         transforms.Resize(val_resize(img_size)), transforms.CenterCrop(img_size),
         transforms.ToTensor(), transforms.Normalize(CLIP_MEAN, CLIP_STD)])
+    split_seed = ck_args.get('split_seed')
+    if split_seed is None:
+        split_seed = ck_args.get('seed', 3407)
     va = ImageFolderNoisy(data, val_tf, True, ck_args.get('val_ratio', 0.1),
-                          ck_args.get('seed', 3407), 'val')
+                          split_seed, 'val')
     assert va.class_to_idx == ck['classes'], (
         'val split found a different class list than the checkpoint -- '
         'wrong --data?')
