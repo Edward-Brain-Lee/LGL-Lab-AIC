@@ -27,6 +27,8 @@ bit-reproducible on the same GPU.
 import argparse
 import contextlib
 import copy
+import csv
+import inspect
 import math
 import os
 import random
@@ -45,6 +47,7 @@ import open_clip
 
 from losses import ce as xent, make_robust_loss
 from noise import LabelTrustTracker, prototype_bootstrap
+from semantic_regularization import semantic_cost, expected_semantic_cost
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -187,6 +190,35 @@ def enable_pos_embed_training(model):
     return pe.numel()
 
 
+def enable_ln_training(model):
+    """Make the tower's LayerNorm gains/biases trainable (``--train-ln``).
+
+    ``Net.__init__`` freezes every backbone parameter that is not a LoRA ``.A``/``.B``,
+    and ``ln_1`` / ``ln_2`` / ``ln_pre`` / ``ln_post`` fall under that blanket.  A
+    LoRA-only run can therefore rescale a sublayer's output but never re-centre it:
+    the normalisation stays at OpenAI's statistics while everything upstream of it has
+    moved.  Re-fitting those 1,536 numbers per norm is the cheapest half of BitFit: 26
+    norms (ln_pre + 12 x (ln_1, ln_2) + ln_post) x 1,536 = 39,936 parameters, and it
+    sits squarely inside rule 五.2, which allows
+    parameter-efficient fine-tuning of the official weights -- nothing here changes
+    which weights are loaded or which backbone is built.
+
+    Must be called after ``Net(...)`` and before the optimiser / EMA teacher, exactly
+    like :func:`enable_pos_embed_training`.
+
+    Returns the number of parameters made trainable.
+    """
+    n = 0
+    for _, mod in model.clip.visual.named_modules():
+        if isinstance(mod, nn.LayerNorm):
+            for p in mod.parameters(recurse=False):
+                p.requires_grad_(True)
+                n += p.numel()
+    if n == 0:
+        raise SystemExit('--train-ln: the vision tower exposes no LayerNorm layers')
+    return n
+
+
 def smooth_target(t, smooth, nclass):
     """Mix a one-hot-ish target towards uniform.
 
@@ -202,6 +234,84 @@ def smooth_target(t, smooth, nclass):
     if smooth <= 0:
         return t
     return (1 - smooth) * t + smooth / nclass
+
+
+def make_class_loss_weights(class_counts, beta=0.0, min_weight=0.5,
+                            max_weight=2.0, device=None):
+    """Build bounded inverse-frequency class weights.
+
+    The sampler already uses ``1/sqrt(freq)``.  This optional second factor is
+    deliberately mild and bounded so a rare class cannot dominate training.
+    ``beta=0`` returns ones, preserving every historical run bit-for-bit.
+    The arithmetic mean is normalised to one before clipping.
+    """
+    counts = torch.as_tensor(class_counts, dtype=torch.float32, device=device)
+    if counts.numel() == 0 or beta <= 0:
+        return torch.ones_like(counts)
+    positive = counts[counts > 0]
+    ref = positive.median() if positive.numel() else counts.new_tensor(1.0)
+    raw = (ref / counts.clamp_min(1.0)).pow(float(beta))
+    raw = raw / raw.mean().clamp_min(1e-6)
+    return raw.clamp(float(min_weight), float(max_weight))
+
+
+def class_margin_loss(logits, target, margin=0.0):
+    """Per-sample multiclass margin penalty for a hard target.
+
+    This is a regulariser, not a replacement loss.  It only asks the selected
+    class to clear the strongest competing class by ``margin`` and therefore
+    works with the same single cosine head used at inference.
+    """
+    margin = torch.as_tensor(margin, dtype=torch.float32, device=logits.device)
+    if not bool((margin > 0).any()):
+        return logits.new_zeros(logits.shape[0])
+    if margin.ndim > 1 or (margin.ndim == 1 and margin.numel() != logits.shape[0]):
+        raise ValueError('margin must be scalar or one value per sample')
+    logits = logits.float()
+    target = target.long()
+    own = logits.gather(1, target[:, None]).squeeze(1)
+    other = logits.clone()
+    other.scatter_(1, target[:, None], float('-inf'))
+    rival = other.max(1).values
+    return F.relu(margin + rival - own)
+
+
+def class_margins(class_counts, margin, power=0.0, device=None):
+    """Bounded frequency-aware margins using official training counts only.
+
+    ``power=0`` gives the same margin to each class. Positive powers increase
+    the tail margin up to ``margin`` without multiplying it on tiny classes.
+    No validation or reconstructed-test statistics enter this calculation.
+    """
+    counts = torch.as_tensor(class_counts, dtype=torch.float32, device=device)
+    return float(margin) * (counts.clamp_min(1).min() / counts.clamp_min(1)).pow(float(power))
+
+
+def view_consistency(z1, z2, mode='mse'):
+    """Historical MSE or a dimension-independent, symmetric cosine penalty."""
+    if mode == 'mse':
+        return F.mse_loss(z1, z2.detach())
+    if mode == 'cosine':
+        return (1 - (F.normalize(z1.float(), dim=-1) *
+                     F.normalize(z2.float(), dim=-1)).sum(-1)).mean()
+    raise ValueError(f'unknown consistency mode {mode}')
+
+
+def optimizer_groups(model, weight_decay, mode='historical'):
+    """Opt-in no-decay scalar/position/norm group; keep historical path exact."""
+    params = [p for p in model.parameters() if p.requires_grad]
+    if mode == 'historical':
+        return params
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if (p.ndim < 2 or name.endswith(('positional_embedding', 'pos_embed'))):
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    return [dict(params=decay, weight_decay=weight_decay),
+            dict(params=no_decay, weight_decay=0.0)]
 
 
 # --------------------------------------------------------------------------- #
@@ -283,32 +393,186 @@ class LoRALinear(nn.Module):
         return self.base(x) + F.linear(self.drop(x), self.B @ self.A) * self.scale
 
 
-def add_lora(module, rank=8, alpha=16, dropout=0.05, target='all', prefix=''):
-    """Wrap every ``nn.Linear`` of ``module`` (``target='mlp'``: MLP only)."""
+# ``is_causal`` / ``average_attn_weights`` were added to the functional attention
+# entry point at different torch versions; probing the signature once keeps
+# LoRAQKVAttention callable on whatever torch the container has.
+_MHA_FORWARD_PARAMS = set(inspect.signature(F.multi_head_attention_forward).parameters)
+
+
+class LoRAQKVAttention(nn.Module):
+    """``nn.MultiheadAttention`` whose fused qkv projection also carries a LoRA update.
+
+    ``add_lora`` walks ``nn.Linear`` children, and this is the one projection that gets
+    away: ``nn.MultiheadAttention`` keeps query/key/value in a bare ``nn.Parameter``
+    (``in_proj_weight``, shape ``(3*dim, dim)``), which a module walk never sees.
+    The parameter arithmetic pins the size of the hole exactly -- ViT-B/32 has 36
+    wrapped modules, and ``out_proj`` (768+768) + ``c_fc`` (768+3072) + ``c_proj``
+    (3072+768) = 9,216 per block x 12 = 110,592 per rank, which is precisely what
+    ``--lora-rank`` costs today.  The qkv projection would add another
+    (768+2304) x 12 = 36,864 per rank, a third on top, in the tensors that actually
+    shape queries and keys.
+
+    ``F.multi_head_attention_forward`` reads qkv as a *Tensor*, so unlike ``out_proj``
+    a merged-weight property cannot be handed to it.  The projection is therefore
+    rebuilt as a plain ``nn.Linear`` -- so the ordinary walk from :func:`add_lora`
+    wraps it on the next pass and the merged matrix shows up as ``self.qkv.weight`` --
+    and the functional entry point is called directly with this module's config.
+
+    Only built when ``--lora-qkv`` (or ``--attn-temp``) is passed, so every existing
+    checkpoint and result keeps its exact module tree.
+
+    ``attn_temp=True`` additionally gives every head its own learnable softmax
+    temperature (see :meth:`_temp_scale`).  It is off by default and, at its
+    initialisation, is *numerically identical* to having no temperature at all.
+    """
+
+    def __init__(self, mha, attn_temp=False):
+        super().__init__()
+        dim = mha.embed_dim
+        qkv = nn.Linear(dim, 3 * dim, bias=mha.in_proj_bias is not None)
+        with torch.no_grad():
+            qkv.weight.copy_(mha.in_proj_weight)
+            if qkv.bias is not None:
+                qkv.bias.copy_(mha.in_proj_bias)
+        self.qkv = qkv                       # add_lora turns this into a LoRALinear
+        self.out_proj = mha.out_proj         # ditto -- keeps the existing out_proj LoRA
+        self.embed_dim, self.num_heads = mha.embed_dim, mha.num_heads
+        self.dropout, self.batch_first = mha.dropout, mha.batch_first
+        self.kdim, self.vdim = mha.kdim, mha.vdim
+        self.add_zero_attn = mha.add_zero_attn
+        # CLIP builds attention with add_bias_kv=False, so these stay None
+        self.bias_k = self.bias_v = None
+        # --attn-temp: rho_h with tau_h = exp(rho_h), one scalar per head.
+        # zeros -> tau == 1 -> the row-scaling below multiplies by exactly 1.0,
+        # which is exact in floating point, so step 0 is bit-for-bit the old path.
+        self.attn_rho = nn.Parameter(torch.zeros(mha.num_heads)) if attn_temp else None
+        self.temp_enabled = attn_temp
+
+    def _temp_scale(self, dtype):
+        """Row scale ``(3E, 1)``: ``exp(rho)`` over each head's query rows, 1.0 elsewhere.
+
+        Applying a factor ``tau_h`` to head ``h``'s query rows multiplies that head's
+        ``q.k`` logits by ``tau_h`` -- the functional path only ever applies a single
+        global ``1/sqrt(head_dim)`` on top, so this is exactly a per-head softmax
+        temperature.  ``k``/``v`` rows keep a factor of exactly ``1.0``, i.e. they are
+        untouched bit-for-bit.
+
+        Why this rather than rewriting the attention forward: it edits only what is
+        *fed into* ``F.multi_head_attention_forward``, so there is no fused-SDPA vs
+        functional numerics question, no change to ``need_weights`` behaviour, and the
+        ``LoRALinear`` merge keeps working through the same ``self.qkv.weight``.
+        """
+        head_dim = self.embed_dim // self.num_heads
+        tau = self.attn_rho.exp().repeat_interleave(head_dim).to(dtype)
+        scale = torch.ones(3 * self.embed_dim, 1, device=tau.device, dtype=dtype)
+        scale[:self.embed_dim, 0] = tau
+        return scale
+
+    def forward(self, query, key, value, key_padding_mask=None, need_weights=True,
+                attn_mask=None, average_attn_weights=True, is_causal=False):
+        key = query if key is None else key
+        value = key if value is None else value
+        # F.multi_head_attention_forward speaks (L, N, E) only; nn.MultiheadAttention
+        # does this transpose itself, so it has to be reproduced here to stay a
+        # drop-in.  Do not hard-code which way open_clip builds it: the pinned
+        # open_clip_torch 3.3.0 leaves Transformer's batch_first at its default
+        # (True), so this reads it off the module instead of assuming.
+        if self.batch_first:
+            query, key, value = (t.transpose(0, 1) for t in (query, key, value))
+        kw = {'training': self.training, 'key_padding_mask': key_padding_mask,
+              'need_weights': need_weights, 'attn_mask': attn_mask}
+        if 'average_attn_weights' in _MHA_FORWARD_PARAMS:
+            kw['average_attn_weights'] = average_attn_weights
+        if 'is_causal' in _MHA_FORWARD_PARAMS:
+            kw['is_causal'] = is_causal
+        # positional order is (query, key, value, embed_dim, num_heads, in_proj_weight,
+        # in_proj_bias, bias_k, bias_v, add_zero_attn, dropout_p, out_proj_weight,
+        # out_proj_bias) -- the merged LoRALinear weights are what make the adapters
+        # on both attention projections take effect on this path
+        proj_w = self.qkv.weight
+        if self.temp_enabled and self.attn_rho is not None:
+            # head-wise temperature folded into the query rows of the fused
+            # projection; the gradient reaches both the LoRA A/B (through
+            # `self.qkv.weight`) and `rho` (through the exp)
+            proj_w = proj_w * self._temp_scale(proj_w.dtype)
+        out, w = F.multi_head_attention_forward(
+            query, key, value, self.embed_dim, self.num_heads,
+            proj_w, self.qkv.bias,
+            self.bias_k, self.bias_v, self.add_zero_attn, self.dropout,
+            self.out_proj.weight, self.out_proj.bias, **kw)
+        if self.batch_first:
+            out = out.transpose(0, 1)
+        # `w` is left as the functional layer returns it: the weight layout for
+        # batch_first changed across torch versions, and every call site in this
+        # project (and in open_clip) passes need_weights=False.  Returning it
+        # untransposed is honest about that rather than silently version-dependent.
+        return out, w
+
+
+def add_lora(module, rank=8, alpha=16, dropout=0.05, target='all', prefix='', qkv=False,
+             attn_temp=False):
+    """Wrap every ``nn.Linear`` of ``module`` (``target='mlp'``: MLP only).
+
+    ``qkv=True`` additionally rebuilds each attention block as a
+    :class:`LoRAQKVAttention`, which brings the fused qkv projection into the sweep
+    (see that class for why the walk misses it otherwise).
+
+    ``attn_temp=True`` needs that same rebuilt block (the per-head temperature lives
+    on it), so it builds the custom attention even when ``qkv`` is off.
+    """
     n = 0
     for name, child in list(module.named_children()):
         full = f'{prefix}.{name}' if prefix else name
+        if isinstance(child, LoRALinear):
+            # already adapted; recursing would find ``base`` and wrap it a second time
+            continue
+        if (qkv or attn_temp) and isinstance(child, nn.MultiheadAttention):
+            child = LoRAQKVAttention(child, attn_temp=attn_temp)
+            setattr(module, name, child)
+            n += add_lora(child, rank, alpha, dropout, target, full, qkv, attn_temp)
+            continue
         is_mlp = name in ('fc1', 'fc2', 'c_fc', 'c_proj', 'mlp')
-        if isinstance(child, nn.Linear) and 'head' not in full.lower() and (target == 'all' or is_mlp):
+        # the rebuilt projection is named 'qkv'; --lora-qkv is what asked for it, so it
+        # is adapted even under --lora-target mlp (out_proj stays MLP-gated as before).
+        # --attn-temp does NOT by itself request a LoRA there: it is a separate axis,
+        # and leaving 'qkv' untouched keeps the two flags independent.
+        wanted = target == 'all' or is_mlp or (qkv and name == 'qkv')
+        if isinstance(child, nn.Linear) and 'head' not in full.lower() and wanted:
             setattr(module, name, LoRALinear(child, rank, alpha, dropout))
             n += 1
         else:
-            n += add_lora(child, rank, alpha, dropout, target, full)
+            n += add_lora(child, rank, alpha, dropout, target, full, qkv, attn_temp)
     return n
 
 
 @contextlib.contextmanager
 def lora_disabled(module):
-    """Temporarily turn every LoRA layer under ``module`` off (-> frozen CLIP)."""
+    """Temporarily turn every LoRA layer under ``module`` off (-> frozen CLIP).
+
+    ``--attn-temp`` has to be switched off here too, and that is not a detail:
+    ``Net.anchor_feat`` means "the frozen official tower".  A learnable attention
+    temperature is part of the *adapted* model, so leaving it live would turn the
+    anchor into a moving target that drifts with ``rho`` -- and, worse, it would
+    silently contaminate every statistic derived from the anchor (the frozen-CLIP
+    class means that seed ``ProtoHead``, and the junk/duplicate filter below).
+    That is exactly the failure shape this project keeps running into: nothing
+    raises, the numbers are just wrong.
+    """
     mods = [m for m in module.modules() if isinstance(m, LoRALinear)]
+    attns = [m for m in module.modules() if isinstance(m, LoRAQKVAttention)]
     prev = [m.enabled for m in mods]
+    prev_attn = [m.temp_enabled for m in attns]
     for m in mods:
         m.enabled = False
+    for m in attns:
+        m.temp_enabled = False
     try:
         yield
     finally:
         for m, p in zip(mods, prev):
             m.enabled = p
+        for m, p in zip(attns, prev_attn):
+            m.temp_enabled = p
 
 
 class CosineClassifier(nn.Module):
@@ -321,6 +585,51 @@ class CosineClassifier(nn.Module):
 
     def forward(self, x):
         return self.logit_scale.exp().clamp(1, 100) * F.linear(F.normalize(x), F.normalize(self.weight))
+
+
+class LocalPatchHead(nn.Module):
+    """A small opt-in patch-token adapter for the frozen CLIP tower.
+
+    The official ViT-B/32 tower still produces the global CLIP embedding.  This
+    head only pools the final spatial tokens exposed by open_clip's
+    ``forward_intermediates`` API and projects them with a trainable adapter.
+    ``gate`` starts at zero so enabling the option is exactly the old global
+    path at step zero; training can then learn whether local evidence helps.
+    The adapter is deliberately tiny and remains a single final classifier at
+    inference time (no ensemble and no second backbone).
+    """
+
+    def __init__(self, width, out_dim, base_proj=None):
+        super().__init__()
+        self.proj = nn.Linear(width, out_dim, bias=False)
+        # open_clip represents the visual projection as either a matrix
+        # Parameter [width, out_dim] or (in some builds) an nn.Linear/
+        # LoRALinear.  Read the frozen base tensor without assuming one form;
+        # otherwise --local-head would fail before the first batch on a valid
+        # ViT-B/32 checkpoint.
+        base_w = None
+        if base_proj is not None:
+            if hasattr(base_proj, 'base') and hasattr(base_proj.base, 'weight'):
+                base_w = base_proj.base.weight.detach()
+            elif hasattr(base_proj, 'weight'):
+                base_w = base_proj.weight.detach()
+            elif torch.is_tensor(base_proj):
+                base_w = base_proj.detach()
+        with torch.no_grad():
+            if base_w is not None and tuple(base_w.shape) == (width, out_dim):
+                self.proj.weight.copy_(base_w.t().float())
+            elif base_w is not None and tuple(base_w.shape) == (out_dim, width):
+                self.proj.weight.copy_(base_w.float())
+            else:
+                nn.init.normal_(self.proj.weight, std=width ** -0.5)
+        # A zero gate preserves the pretrained global representation at the
+        # beginning of a run, while still giving the adapter a useful gradient.
+        self.gate = nn.Parameter(torch.zeros(()))
+
+    def forward(self, tokens):
+        # tokens are final, layer-normalised spatial tokens: [B, N, width]
+        pooled = tokens.mean(dim=1)
+        return F.normalize(self.proj(pooled).float(), dim=-1)
 
 
 class ProtoHead(nn.Module):
@@ -375,34 +684,114 @@ class ProtoHead(nn.Module):
 
 class Net(nn.Module):
     def __init__(self, clip_model, nclass, lora_rank=8, lora_target='all',
-                 proto_momentum=0.99, proto_temp=0.1):
+                 proto_momentum=0.99, proto_temp=0.1, local_head=False,
+                 lora_qkv=False, lora_alpha=0.0, attn_temp=False):
         super().__init__()
         self.clip = clip_model
         dim = clip_model.visual.output_dim
         self.head = CosineClassifier(dim, nclass)
         self.proto = ProtoHead(dim, nclass, proto_momentum, proto_temp)
-        self.n_lora = add_lora(self.clip.visual, lora_rank, 2 * lora_rank, target=lora_target)
+        # alpha/rank is the adapter's effective step size; --lora-alpha 0 keeps the
+        # 2*rank every run so far used, which fixes the ratio at 2 whatever the rank
+        alpha = lora_alpha if lora_alpha > 0 else 2 * lora_rank
+        self.lora_alpha, self.lora_qkv, self.attn_temp = alpha, lora_qkv, attn_temp
+        self.n_lora = add_lora(self.clip.visual, lora_rank, alpha,
+                               target=lora_target, qkv=lora_qkv, attn_temp=attn_temp)
+        self._anchor_names = {}
         for name, p in self.clip.named_parameters():
-            if not ('.A' in name or '.B' in name):
+            # 'attn_rho' is matched by name rather than by a substring marker: it is a
+            # brand-new trainable tensor (--attn-temp), not part of the official tower,
+            # and the LoRA '.A'/'.B' markers do not catch it -- without this exemption
+            # it would be frozen here and the flag would silently do nothing.
+            if not ('.A' in name or '.B' in name or name.endswith('attn_rho')):
                 p.requires_grad = False
+        self.local_head = None
+        if local_head:
+            visual = self.clip.visual
+            width = getattr(getattr(visual, 'transformer', None), 'width', None)
+            if width is None:
+                # ViT-B/32 is the only allowed tower, but keep this diagnostic
+                # explicit instead of failing later with an obscure shape error.
+                raise SystemExit('local patch head requires a ViT visual transformer with a width')
+            self.local_head = LocalPatchHead(int(width), int(dim),
+                                             getattr(visual, 'proj', None))
 
     def forward(self, x, return_feat=False):
-        z = F.normalize(self.clip.encode_image(x).float(), dim=-1)
+        if self.local_head is None:
+            # exactly the historical global-only path, so runs without
+            # --local-head are unaffected by this branch existing at all
+            z = F.normalize(self.clip.encode_image(x).float(), dim=-1)
+        else:
+            visual = self.clip.visual
+            if not hasattr(visual, 'forward_intermediates'):
+                raise RuntimeError('this open_clip visual tower has no forward_intermediates; '
+                                   'disable --local-head or upgrade the pinned open_clip')
+            nblock = len(getattr(getattr(visual, 'transformer', None), 'resblocks', []))
+            if not nblock:
+                raise RuntimeError('cannot locate ViT transformer blocks for local patch head')
+            d = visual.forward_intermediates(
+                x, indices=[nblock - 1], stop_early=False,
+                normalize_intermediates=True, intermediates_only=False,
+                output_fmt='NLC')
+            z_global = F.normalize(d['image_features'].float(), dim=-1)
+            toks = d['image_intermediates'][-1]
+            z_local = self.local_head(toks)
+            # tanh keeps the learned residual bounded; gate=0 makes the exact
+            # initial model equal to the historical global-only path.
+            z = F.normalize(z_global + torch.tanh(self.local_head.gate) * z_local, dim=-1)
         out = self.head(z)
         return (out, z) if return_feat else out
 
     @torch.no_grad()
+    def freeze_anchor_reference(self):
+        """Snapshot trainable backbone parameters from the official initial tower.
+
+        Call once after enabling PE/LayerNorm training and before optimisation.
+        LoRA is disabled separately. Nonpersistent buffers move with the model
+        but are training-only and never enter inference checkpoints.
+        """
+        if self._anchor_names:
+            raise RuntimeError('anchor reference already captured')
+        for name, p in self.clip.visual.named_parameters():
+            # 'attn_rho' is excluded like LoRA's A/B: it belongs to the adapted model,
+            # not to the official tower this reference is a snapshot of
+            if p.requires_grad and not name.endswith(('.A', '.B', 'attn_rho')):
+                buffer_name = f'_anchor_reference_{len(self._anchor_names)}'
+                self.register_buffer(buffer_name, p.detach().clone(), persistent=False)
+                self._anchor_names[name] = buffer_name
+
+    @torch.no_grad()
     def anchor_feat(self, x):
-        """Frozen-CLIP embedding of ``x`` (LoRA off, eval mode, no grad)."""
+        """LoRA-disabled anchor; optional fixed initial PE/LayerNorm reference."""
         visual = self.clip.visual
         was_training = visual.training
         visual.eval()
         try:
             with lora_disabled(visual):
-                z = visual(x)
+                if self._anchor_names:
+                    state = {name: getattr(self, buffer_name)
+                             for name, buffer_name in self._anchor_names.items()}
+                    z = torch.func.functional_call(visual, state, (x,), strict=False)
+                else:
+                    z = visual(x)
         finally:
             visual.train(was_training)
         return F.normalize(z.float(), dim=-1)
+
+    @torch.no_grad()
+    def attn_temperature(self):
+        """Every block's per-head softmax temperatures as one flat tensor (--attn-temp).
+
+        ``None`` when the flag is off.  Reporting min/mean/max each epoch is the only
+        way to see *which direction* the model moved the attention: the transfer
+        literature (Zou et al., NeurIPS 2024) found a pretrained ViT usually needs
+        *softer* attention, but that was cross-domain few-shot while this is
+        same-domain fine-grained, where sharpening is equally plausible.  The sign is
+        a measurement, not an assumption.
+        """
+        taus = [m.attn_rho.exp() for m in self.clip.visual.modules()
+                if isinstance(m, LoRAQKVAttention) and m.attn_rho is not None]
+        return torch.cat(taus) if taus else None
 
     def trainable_state_dict(self):
         """Only what is actually trained -- the frozen backbone is rebuilt from
@@ -475,6 +864,18 @@ class TwoView(Dataset):
         return self.base.transform(img), self.base.transform(img), y, i
 
 
+def eval_transform(a):
+    """The deterministic view: one resize + one centre crop.
+
+    Shared with the ``--junk-filter`` frozen pass, for the same reason inference
+    shares it: a filter that compares one sample against every other only means
+    something if both sides were cropped the same way.
+    """
+    return transforms.Compose([
+        transforms.Resize(val_resize(a.img_size)), transforms.CenterCrop(a.img_size),
+        transforms.ToTensor(), transforms.Normalize(CLIP_MEAN, CLIP_STD)])
+
+
 def build_datasets(a):
     train_tf = transforms.Compose([
         transforms.RandomResizedCrop(a.img_size, scale=(a.crop_min, 1.0)),
@@ -482,11 +883,10 @@ def build_datasets(a):
         transforms.RandAugment(a.randaug_n, a.randaug_m),
         transforms.ToTensor(),
         transforms.Normalize(CLIP_MEAN, CLIP_STD)])
-    val_tf = transforms.Compose([
-        transforms.Resize(val_resize(a.img_size)), transforms.CenterCrop(a.img_size),
-        transforms.ToTensor(), transforms.Normalize(CLIP_MEAN, CLIP_STD)])
-    tr = ImageFolderNoisy(a.data, train_tf, False, a.val_ratio, a.seed, 'train', a.img_size)
-    va = ImageFolderNoisy(a.data, val_tf, True, a.val_ratio, a.seed, 'val', a.img_size)
+    val_tf = eval_transform(a)
+    split_seed = a.seed if a.split_seed is None else a.split_seed
+    tr = ImageFolderNoisy(a.data, train_tf, False, a.val_ratio, split_seed, 'train', a.img_size)
+    va = ImageFolderNoisy(a.data, val_tf, True, a.val_ratio, split_seed, 'val', a.img_size)
     assert len(tr) > 0, f'no images found under {a.data}'
     return tr, va
 
@@ -499,7 +899,9 @@ def build_loaders(a, tr, va):
         weights = torch.ones(len(tr), dtype=torch.double)
     g = torch.Generator()
     g.manual_seed(a.seed)
-    sampler = WeightedRandomSampler(weights, len(weights), replacement=True, generator=g)
+    sampler = (torch.utils.data.RandomSampler(tr, replacement=False, generator=g)
+               if a.sampler == 'shuffle' else
+               WeightedRandomSampler(weights, len(weights), replacement=True, generator=g))
     loader = DataLoader(TwoView(tr), batch_size=a.batch_size, sampler=sampler,
                         num_workers=a.workers, pin_memory=True, drop_last=True,
                         persistent_workers=a.workers > 0, worker_init_fn=seed_worker,
@@ -510,20 +912,258 @@ def build_loaders(a, tr, va):
 
 
 # --------------------------------------------------------------------------- #
+# junk / duplicate filtering on the frozen tower  (--junk-filter)
+# --------------------------------------------------------------------------- #
+@torch.no_grad()
+def frozen_feature_pass(model, dataset, device, amp_dtype, use_amp, batch_size=256,
+                        workers=8, every=200):
+    """Frozen-CLIP features for *every* item of ``dataset``, in index order.
+
+    The whole reason this is a separate pass rather than an accumulator fed by the
+    warm-up loop is coverage.  The warm-up sampler draws from
+    ``WeightedRandomSampler``, so it sees about 63% of the split per epoch, and the
+    samples it misses are the rare ones -- exactly the classes a filter must not be
+    allowed to consign to "unjudged".  A filter that silently abstains on the samples
+    it was meant to look at is this project's standard failure mode, so the features
+    come from a deterministic ``shuffle=False, drop_last=False`` sweep instead.
+
+    The dataset must carry the *eval* transform: near-duplicate detection compares
+    one sample against every other, which only means anything if both views of the
+    same file were cropped the same way.
+
+    Returns ``(feat, seen)`` with ``feat`` on ``device`` in float32, row ``i``
+    belonging to training index ``i``.
+    """
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=workers,
+                        pin_memory=True, persistent_workers=workers > 0, drop_last=False)
+    model.eval()
+    dim = model.head.weight.shape[-1]
+    feat = torch.zeros(len(dataset), dim, device=device)
+    seen = torch.zeros(len(dataset), dtype=torch.bool)
+    for it, (x, y, idx) in enumerate(loader):
+        x = x.to(device, non_blocking=True)
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+            z = model.anchor_feat(x)                    # LoRA off -> the official tower
+        feat[idx.to(device)] = z.float()
+        seen[idx] = True
+        if every and (it + 1) % every == 0:
+            print(f'  [junk] frozen pass {it + 1}/{len(loader)} batches', flush=True)
+    n_missing = int((~seen).sum())
+    if n_missing:
+        # A hole here is not cosmetic: an unjudged sample keeps weight 1.0 and a
+        # zero row would score cosine 0 against every centroid, which is a *neutral*
+        # competitor rather than a bad one.
+        print(f'  !! 警告: 冻结特征 pass 漏了 {n_missing} 个样本（判据对它们一律弃权）。')
+    return feat, seen
+
+
+@torch.no_grad()
+def robust_centroids(feat, targets, nclass, rounds=2, chunk=8192, verbose=True):
+    """``(means, present, keep)`` for class centroids that survive label noise.
+
+    Round 1 averages every sample a class folder contains -- which is what the
+    training labels say, and therefore inherits their noise (on this dataset about a
+    quarter of the labels are wrong, and a plain mean drags each centroid towards
+    whatever the folder is confused with).  Every later round keeps only the samples
+    whose *given* label is already the nearest centroid -- a sample the frozen tower
+    can confirm without ever having been trained on it -- and re-averages on that
+    subset.  That kept set is the same construction ``probe.py`` calls ``V*``.
+
+    The class is never allowed to disappear: a class whose samples all disagree is
+    telling us its whole folder is systematically wrong, and the honest answer is to
+    keep its noisy mean rather than delete it from the decision space.  An absent
+    class would have a zero centroid, and a zero centroid scores cosine 0 against
+    everything -- a *neutral* competitor, which beats a genuinely anti-correlated
+    real class.  Its similarity is forced to -2 everywhere instead.
+
+    Deterministic, training split only, no manual step (rule 五.6).
+    """
+    z = F.normalize(feat.float(), dim=-1)
+    y = torch.as_tensor(targets, dtype=torch.long, device=z.device)
+    dim = z.shape[1]
+    keep = torch.ones(y.numel(), dtype=torch.bool, device=z.device)
+
+    def estimate(mask):
+        sums = torch.zeros(nclass, dim, device=z.device)
+        cnt = torch.zeros(nclass, device=z.device)
+        sel = y[mask]
+        sums.index_add_(0, sel, z[mask])
+        cnt.index_add_(0, sel, torch.ones(sel.numel(), device=z.device))
+        present = cnt > 0
+        means = F.normalize(sums, dim=-1)
+        means[~present] = 0.0
+        return means, present
+
+    def agrees_with(means, present):
+        out = torch.empty(z.shape[0], dtype=torch.bool, device=z.device)
+        for s in range(0, z.shape[0], chunk):
+            e = min(s + chunk, z.shape[0])
+            sim = z[s:e] @ means.t()
+            sim[:, ~present] = -2.0
+            out[s:e] = sim.argmax(1) == y[s:e]
+        return out
+
+    means, present = estimate(keep)
+    for r in range(max(0, int(rounds))):
+        agree = agrees_with(means, present)
+        nxt = keep & agree
+        for c in range(nclass):
+            old_c = keep & (y == c)
+            if bool(old_c.any()) and not bool((nxt & (y == c)).any()):
+                nxt[old_c] = True
+        if verbose:
+            n_keep = int(keep.sum())
+            print(f'  [junk] centroid round {r + 1}/{rounds}: {int(present.sum())}/{nclass} classes, '
+                  f'agree {int((keep & agree).sum())}/{n_keep} '
+                  f'({float((keep & agree).float().sum()) / max(n_keep, 1):.3f} kept)')
+        if int(nxt.sum()) == 0:
+            print('  [junk] every sample was rejected; keeping the previous round')
+            break
+        keep = nxt
+        means, present = estimate(keep)
+    return means, present, keep
+
+
+@torch.no_grad()
+def junk_weights(feat, targets, means, present, mode='both', dedup_tau=0.98,
+                 max_frac=0.05, floor=0.2, chunk=2048, verbose=True):
+    """Per-sample multipliers in ``[floor, 1]`` from the frozen-CLIP features.
+
+    Two independent judgements, both made by a model that never saw a label of this
+    dataset, and both **demotions only** -- nothing is deleted, relabelled, or
+    reordered:
+
+    * ``margin`` -- the frozen tower prefers another class's robust centroid for this
+      image by ``other - own``.  This is the rule that catches 杂图: a folder named by
+      an English search keyword holds things other than the keyword, and an image
+      that belongs to no class at all has an essentially arbitrary argmax, so it
+      disagrees with its given label with probability ~749/750.  Samples whose own
+      class has no centroid are never judged.
+    * ``dedup`` -- some earlier index has cosine above ``dedup_tau``.  "Keep the first
+      occurrence" turns every near-duplicate cluster into one representative, because
+      a model trained on the same picture ten times over-learns it.
+
+    Both rules are self-calibrating in the sense that matters: the margin has no
+    threshold to guess (0 is the natural cut, and the *cap* does the bounding), and a
+    cosine above 0.98 between two different files is a hard verdict rather than a
+    tuned one.
+
+    ``max_frac`` is the safety valve, and it is the primary control, not an
+    afterthought: at most ``max_frac`` of the split may be touched, the most extreme
+    offenders first (duplicates outrank margin flags), and the run says so when the
+    cap binds.  This project has already paid for the alternative -- ``--tau-conf
+    0.8`` pinned a 40% cap on every epoch of a full run and nobody noticed until it
+    was over.  The strength of this filter has *never* been calibrated on this
+    dataset, which is exactly why the first run is allowed to touch only a small
+    fraction of it.
+
+    Returns ``(w, report)``; ``w`` is float32 on the features' device, and is 1.0
+    for every sample outside the selected set.
+    """
+    z = F.normalize(feat.float(), dim=-1)
+    y = torch.as_tensor(targets, dtype=torch.long, device=z.device)
+    # `means` is only supplied by the margin rule; dedup-only runs still need the class
+    # count for the per-class report, and the labels are the honest source for it.
+    n = z.shape[0]
+    nclass = int(means.shape[0]) if means is not None else int(y.max()) + 1
+    report = {'mode': mode, 'n': n, 'judged': 0, 'dup': 0, 'dup_cross': 0.0,
+              'margin_pos': 0, 'margin_q': None, 'flagged': 0, 'cap': 0,
+              'cap_bound': False, 'per_class_max': 0.0, 'classes_over_20pct': 0}
+
+    # ---- rule 1: the frozen tower would have called this image something else
+    key = torch.zeros(n, device=z.device)
+    if mode in ('margin', 'both'):
+        judged = present[y]
+        margin = torch.zeros(n, device=z.device)
+        for s in range(0, n, chunk):
+            e = min(s + chunk, n)
+            sim = z[s:e] @ means.t()        # (chunk, nclass); the full matrix is 446 MB
+            sim[:, ~present] = -2.0
+            own = sim.gather(1, y[s:e, None]).squeeze(1)
+            other = sim.masked_fill(F.one_hot(y[s:e], nclass).bool(), -2.0).max(1).values
+            margin[s:e] = torch.where(judged[s:e], other - own, torch.zeros(1, device=z.device))
+        report['judged'] = int(judged.sum())
+        report['margin_pos'] = int((margin > 0).sum())
+        q = torch.tensor([.5, .9, .99, 1.0], device=z.device)
+        report['margin_q'] = [round(float(v), 4) for v in margin.clamp_min(0).quantile(q)]
+        # ranking only -- the cut is the cap, so this normalisation is free
+        key = margin.clamp_min(0) / margin.clamp_min(0).max().clamp_min(1e-6)
+
+    # ---- rule 2: near-duplicates, first occurrence kept
+    if mode in ('dedup', 'both'):
+        zz = z.half() if z.is_cuda else z
+        cols = torch.arange(n, device=z.device)
+        dup_best = torch.full((n,), -2.0, device=z.device)
+        dup_arg = torch.zeros(n, dtype=torch.long, device=z.device)
+        for s in range(0, n, chunk):
+            e = min(s + chunk, n)
+            sim = zz[s:e] @ zz.t()
+            sim.masked_fill_(cols[None, :] >= torch.arange(s, e, device=z.device)[:, None], -2.0)
+            best, arg = sim.max(1)
+            dup_best[s:e] = best.float()
+            dup_arg[s:e] = arg
+        dup = dup_best > dedup_tau
+        report['dup'] = int(dup.sum())
+        if report['dup']:
+            report['dup_cross'] = round(float((y[dup_arg[dup]] != y[dup]).float().mean()), 4)
+        key = key + 2.0 * dup.float()          # a duplicate always outranks a margin flag
+
+    # ---- the cap.  Top `max_frac` of the split by severity, ties by index order.
+    cand = key > 0
+    k = min(int(max_frac * n), int(cand.sum()))
+    report['cap'] = k
+    report['cap_bound'] = bool(int(cand.sum()) > k and k > 0)
+    if k <= 0:
+        if verbose:
+            print('  [junk] nothing crossed either rule; every sample keeps weight 1.0')
+        return torch.ones(n), report
+    topk = torch.topk(key, k, largest=True, sorted=False).indices
+    w = torch.ones(n, device=z.device)
+    w[topk] = float(floor)
+    report['flagged'] = k
+
+    # ---- per-class report: the risk of a filter is a class quietly emptied out
+    n_class = torch.bincount(y, minlength=nclass).clamp_min(1)
+    hit = torch.bincount(y[topk], minlength=nclass).float() / n_class
+    report['per_class_max'] = round(float(hit.max()), 4)
+    report['classes_over_20pct'] = int((hit > 0.2).sum())
+    if verbose:
+        mq = report['margin_q']
+        print(f'  [junk] mode={mode}: judged {report["judged"]}/{n} '
+              f'(own class has a centroid); frozen tower prefers another class for '
+              f'{report["margin_pos"]} of them')
+        print(f'  [junk] margin quantiles (p50/p90/p99/max) = {mq}')
+        if mode in ('dedup', 'both'):
+            print(f'  [junk] near-duplicates >{dedup_tau}: {report["dup"]} '
+                  f'({report["dup_cross"]:.1%} of them across classes)')
+        print(f'  [junk] flagged {k}/{n} = {k / n:.2%} at weight {floor} '
+              f'(cap {max_frac:.1%}); mean weight {float(w.mean()):.4f}')
+        if report['cap_bound']:
+            print(f'  !! 警告: --junk-max-frac={max_frac} 顶死了 —— 判据想标记的样本比名额多，'
+                  f'这次只处理了最极端的 {k} 个。要么接受，要么调大它（先看上面的分位数）。')
+        print(f'  [junk] per-class flag rate: max {report["per_class_max"]:.1%}, '
+              f'{report["classes_over_20pct"]} classes over 20%')
+    return w, report
+
+
+# --------------------------------------------------------------------------- #
 # train / eval
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
-def evaluate(model, loader, device, amp_dtype, use_amp):
-    """Returns (loss, accuracy, accuracy on high-confidence predictions).
+def evaluate(model, loader, device, amp_dtype, use_amp, nclass=None, class_counts=None):
+    """Evaluate a checkpoint on the fixed training-data hold-out split.
 
-    The hold-out split carries the *same* label noise as the training set, so
-    ``acc_hi`` (accuracy restricted to confident predictions) is a useful sanity
-    signal on how much of the model's error is label noise rather than model
-    error.
+    Besides micro accuracy, return class-balanced and tail-class recalls.  All
+    quantities are computed from the supplied hold-out labels only; no external
+    files or test-set statistics are involved.
     """
     model.eval()
     n = correct = n_hi = correct_hi = 0
     total_loss = 0.0
+    if nclass is None:
+        nclass = 0
+    per_correct = torch.zeros(nclass, dtype=torch.long)
+    per_total = torch.zeros(nclass, dtype=torch.long)
     for x, y, _ in loader:
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
@@ -532,17 +1172,41 @@ def evaluate(model, loader, device, amp_dtype, use_amp):
         total_loss += F.cross_entropy(out, y, reduction='sum').item()
         pred = out.argmax(1)
         correct += (pred == y).sum().item()
+        if nclass:
+            per_correct.index_add_(0, y.cpu(), (pred == y).cpu().long())
+            per_total.index_add_(0, y.cpu(), torch.ones_like(y.cpu(), dtype=torch.long))
         hi = out.softmax(1).max(1).values >= 0.8
         n_hi += int(hi.sum())
         correct_hi += int(((pred == y) & hi).sum())
         n += y.numel()
-    return total_loss / n, correct / n, (correct_hi / n_hi if n_hi else 0.0)
+    recall = per_correct.float() / per_total.clamp_min(1).float() if nclass else torch.empty(0)
+    present = per_total > 0
+    macro = float(recall[present].mean()) if bool(present.any()) else 0.0
+    if class_counts is None:
+        class_counts = per_total.tolist()
+    freq = torch.as_tensor(class_counts, dtype=torch.float32)
+    order = torch.argsort(freq)
+    order = order[present[order]]
+    k = max(1, int(math.ceil(max(int(present.sum()), 1) * 0.2)))
+    tail_idx = order[:k]
+    tail_idx = tail_idx[present[tail_idx]]
+    tail = float(recall[tail_idx].mean()) if tail_idx.numel() else macro
+    # Laplace smoothing prevents a one-image class from dominating selection.
+    smooth = (per_correct.float() + 1.0) / (per_total.float() + 2.0)
+    worst = float(smooth[present].min()) if bool(present.any()) else 0.0
+    balanced = 0.5 * macro + 0.3 * tail + 0.2 * worst
+    return (total_loss / max(n, 1), correct / max(n, 1),
+            (correct_hi / n_hi if n_hi else 0.0), macro, tail, balanced,
+            recall, per_total)
 
 
 # what an inference-only checkpoint needs; everything else (optimiser, RNG,
 # tracker) is only read back by `--resume`, which only ever loads `last.pt`
 SNAPSHOT_KEYS = ('model', 'classes', 'class_counts', 'args', 'epoch', 'val_acc',
-                 'val_acc_hi', 'lora_rank', 'lora_target', 'pretrained', 'model_name')
+                 'val_macro', 'val_tail', 'val_balanced',
+                 'val_acc_hi', 'lora_rank', 'lora_target', 'lora_alpha', 'lora_qkv',
+                 'train_ln', 'pretrained', 'model_name', 'local_head', 'attn_temp',
+                 'junk_w', 'junk_report')
 
 
 def thin(ck):
@@ -577,6 +1241,32 @@ def main(a):
     # training set is not, so the two priors differ)
     freq = Counter(tr.targets)
     class_counts = [freq.get(i, 0) for i in range(nclass)]
+    class_weights = make_class_loss_weights(
+        class_counts, a.class_weight_beta, a.class_weight_min,
+        a.class_weight_max, device=device)
+    margins = class_margins(class_counts, a.class_margin, a.class_margin_power, device)
+    semantic_distance = None
+    if a.semantic_weight > 0:
+        if not a.semantic_reference:
+            raise ValueError('--semantic-weight requires --semantic-reference')
+        from build_semantic_reference import split_fingerprint
+        reference = torch.load(a.semantic_reference, map_location='cpu', weights_only=False)
+        if (reference.get('provenance') != 'official-training-only' or
+                reference.get('backbone') != 'ViT-B-32-quickgelu' or
+                reference.get('pretrained', 'openai') != a.pretrained or
+                reference.get('classes') != tr.class_to_idx or
+                reference.get('train_fingerprint') != split_fingerprint(tr) or
+                reference['counts'].tolist() != class_counts):
+            raise ValueError('semantic reference must describe this exact official training split')
+        prototypes = reference['prototypes']
+        if prototypes.ndim != 2 or prototypes.shape[0] != nclass or not torch.isfinite(prototypes).all():
+            raise ValueError('invalid semantic prototype tensor')
+        semantic_distance = semantic_cost(prototypes).to(device)
+        print(f'semantic reference loaded from official training: {semantic_distance.shape}')
+    if a.class_weight_beta > 0:
+        print('class-conditional loss weights: '
+              f'beta={a.class_weight_beta:g} range='
+              f'{float(class_weights.min()):.3f}..{float(class_weights.max()):.3f}')
     print(f'classes={nclass} train={len(tr)} val={len(va)} device={device} amp={a.amp}')
     print('config: ' + ' '.join(f'{k}={v}' for k, v in sorted(vars(a).items())))
 
@@ -585,13 +1275,22 @@ def main(a):
         grid = resize_positional_embedding(clip_model.visual, a.img_size)
         print(f'img_size={a.img_size}: positional grid resampled to {grid}x{grid}')
     model = Net(clip_model, nclass, a.lora_rank, a.lora_target,
-                a.proto_momentum, a.proto_temp).to(device)
+                a.proto_momentum, a.proto_temp, a.local_head,
+                a.lora_qkv, a.lora_alpha, a.attn_temp).to(device)
     if a.train_pos_embed:
         # after Net() (which freezes the backbone) and before the optimiser / teacher
         n_pe = enable_pos_embed_training(model)
         print(f'--train-pos-embed: positional grid is now trainable ({n_pe/1e3:.1f}k params)')
+    if a.train_ln:
+        n_ln = enable_ln_training(model)
+        print(f'--train-ln: LayerNorm gains/biases are now trainable ({n_ln/1e3:.1f}k params)')
+    if a.fixed_anchor:
+        model.freeze_anchor_reference()
+        print(f'--fixed-anchor: captured {len(model._anchor_names)} initial backbone tensors')
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f'model={a.model}/{a.pretrained} layers={model.n_lora} trainable params={n_train/1e6:.3f}M')
+    print(f'model={a.model}/{a.pretrained} layers={model.n_lora} lora_alpha={model.lora_alpha:g} '
+          f'lora_qkv={model.lora_qkv} attn_temp={model.attn_temp} '
+          f'trainable params={n_train/1e6:.3f}M')
 
     teacher = copy.deepcopy(model).to(device).eval()
     for p in teacher.parameters():
@@ -607,7 +1306,7 @@ def main(a):
                                 relabel_mix=a.relabel_mix, device=device)
     robust = make_robust_loss(a.robust_loss, a.gce_q, a.apl_k, a.apl_b, a.apl_rce)
 
-    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
+    opt = torch.optim.AdamW(optimizer_groups(model, a.weight_decay, a.optimizer_groups),
                             lr=a.lr, weight_decay=a.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.epochs)
     use_amp = a.amp != 'none' and device.type == 'cuda'
@@ -617,13 +1316,41 @@ def main(a):
     except (AttributeError, TypeError):
         scaler = torch.cuda.amp.GradScaler(enabled=use_amp and a.amp == 'fp16')
 
-    # -1.0, not 0.0: with --select val_acc_hi the score is 0.0 for exactly as
-    # long as no sample clears max(p) >= 0.8, which on 750 classes can hold for
-    # the first epochs -- and `score > best` would then write no best.pt at all.
-    # Starting below every possible score guarantees the first epoch lands one.
+    # -1.0 guarantees that the first completed epoch is saved even when a
+    # confidence-filtered metric is zero during warm-up.
+    junk_w, junk_report = None, None
     start_epoch, best = 0, -1.0
     if a.resume:
         ck = torch.load(a.resume, map_location='cpu', weights_only=False)
+        # load_state_dict(strict=False) below silently ignores tensors the model has no
+        # slot for, so a mismatch here would resume as a *different* run without a word
+        ck_temp = any(k.endswith('attn_rho') for k in ck['model'])
+        if ck_temp != bool(a.attn_temp):
+            raise SystemExit(
+                f'--resume: the checkpoint {"carries" if ck_temp else "carries no"} attn_rho '
+                f'tensors but this run was started with --attn-temp={bool(a.attn_temp)}. '
+                f'Resuming would silently drop the temperatures.  Re-run with the same flag.')
+        # The junk weights are state, exactly like the tracker's: recomputing them on
+        # resume would rebuild them from the *resumed* tower (which has drifted under
+        # --train-pos-embed), and the run would quietly switch objectives mid-flight.
+        # So they travel in the checkpoint, and a flag/checkpoint mismatch is fatal
+        # in both directions -- a checkpoint that carries them must not be resumed
+        # without the filter, and one that does not must not be resumed with it.
+        ck_junk = ck.get('junk_w')
+        if ck_junk is None and a.junk_filter != 'off':
+            raise SystemExit(
+                '--resume: this checkpoint carries no junk weights but the run was started '
+                f'with --junk-filter={a.junk_filter}; the effective loss would change '
+                'mid-run.  Re-run with --junk-filter off, or start a fresh run.')
+        if ck_junk is not None and a.junk_filter == 'off':
+            raise SystemExit(
+                '--resume: this checkpoint was trained with a junk filter but the run was '
+                'started with --junk-filter off; resuming would silently un-weight those '
+                f'{int((ck_junk < 1).sum())} samples.  Re-run with the matching --junk-filter.')
+        if ck_junk is not None:
+            junk_w, junk_report = ck_junk, ck.get('junk_report')
+            print(f'resumed the {int((junk_w < 1).sum())} down-weighted samples from the '
+                  f'checkpoint; the --junk-* flags are inert for the rest of this run')
         model.load_state_dict(ck['model'], strict=False)
         teacher = copy.deepcopy(model).to(device).eval()
         for p in teacher.parameters():
@@ -636,8 +1363,46 @@ def main(a):
             torch.cuda.set_rng_state_all(ck['rng']['cuda'])
         random.setstate(ck['rng']['python'])
         start_epoch = ck['epoch'] + 1
-        best = ck.get('val_acc' if a.select == 'val_acc' else 'val_acc_hi', -1.0)
+        best = ck.get(a.select, -1.0)
         print(f'resumed from {a.resume} at epoch {start_epoch} (best={best:.4f})')
+
+    # ---- junk / duplicate screening.  Runs before epoch 1, and only on a fresh run,
+    # for one reason: the frozen tower must be the *official* one.  --train-pos-embed
+    # moves the positional grid from the first backward pass on (unless --fixed-anchor
+    # is holding a reference), so a pass run at the end of warm-up -- or after a
+    # --resume -- would judge the dataset with a slightly different tower each time.
+    # Doing it once, up front, makes the weights a function of the input files alone.
+    if a.junk_filter != 'off' and junk_w is None:
+        print(f'--junk-filter {a.junk_filter}: one deterministic frozen-CLIP pass over '
+              f'{len(tr)} training images (eval transform, no gradients)')
+        fds = ImageFolderNoisy(a.data, eval_transform(a), False, a.val_ratio,
+                               a.seed if a.split_seed is None else a.split_seed, 'train',
+                               a.img_size)
+        # The index alignment between this dataset and `tr` is load-bearing -- the
+        # weights it produces are addressed by `tr`'s own positions -- so a mismatch
+        # must stop the run rather than silently reweight the wrong images.
+        if fds.items != tr.items:
+            raise SystemExit('--junk-filter: the frozen pass built a different training split '
+                             'than the training loop; its per-sample weights would be attached '
+                             'to the wrong images.  This is a bug in train.py, not in the flags.')
+        feat, _ = frozen_feature_pass(model, fds, device, amp_dtype, use_amp,
+                                      batch_size=a.batch_size * 2, workers=a.workers)
+        means = present = None
+        if a.junk_filter in ('margin', 'both'):
+            means, present, _ = robust_centroids(feat, tr.targets, nclass,
+                                                 rounds=a.junk_centroid_rounds)
+        junk_w, junk_report = junk_weights(feat, tr.targets, means, present, mode=a.junk_filter,
+                                           dedup_tau=a.junk_dedup_tau, max_frac=a.junk_max_frac,
+                                           floor=a.junk_floor)
+        junk_w = junk_w.cpu()                    # 595 KB; the loop indexes it by idx_g
+        del feat, means
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+
+    # `junk_w[idx_g]` runs once per batch, so it must already be on the device.  The
+    # checkpoint keeps the CPU copy: a CUDA tensor in the saved dict would tie the
+    # file to this machine's device count for no benefit.
+    junk_w_dev = junk_w.to(device) if junk_w is not None else None
 
     probe = next(iter(loader))
     print(f'first batch ok: x1={tuple(probe[0].shape)} x2={tuple(probe[1].shape)} '
@@ -670,6 +1435,9 @@ def main(a):
         model.train()
         t0 = time.time()
         running, seen = 0.0, 0
+        margin_eligible = margin_active = margin_seen = 0
+        consistency_sum = 0.0
+        semantic_sum = semantic_eligible = 0
         for it, (x1, x2, y, idx) in enumerate(loader):
             if a.limit_batches and it >= a.limit_batches:
                 break
@@ -706,8 +1474,31 @@ def main(a):
                 mix_t = tracker.target(idx_g, y)
                 soft = smooth_target(mix_t, a.label_smooth, nclass)
                 w = tracker.weight[idx_g] * tprob.max(1).values.clamp(a.conf_floor, 1.0).pow(a.conf_gamma)
+
+            # The junk/duplicate weights, applied once, to the warm-up objective as
+            # well as to everything after it.  Warm-up is where this project's own
+            # measurement says the leaderboard-relevant state gets decided (ep4 ==
+            # ep20 to four decimals, §16.1), so a filter that only switched on
+            # afterwards would be screening samples at the point where they no longer
+            # matter.  It also keeps `w` meaning one thing for the whole run.
+            # The `not warm` on the normalisation below is deliberate: rescaling to
+            # mean 1 would *raise* every surviving sample's weight during warm-up, so
+            # it would put two changes into the warm-up objective instead of one.
+            if junk_w_dev is not None:
+                w = w * junk_w_dev[idx_g]
+
+            if not warm and a.norm_weights:
+                # keep the effective step size stable as filtering kicks in
+                w = w / w.mean().clamp_min(1e-6)
+
+            # Optional bounded tail correction.  It is applied after the
+            # existing trust/confidence weight so noisy samples remain down-
+            # weighted.  The default beta=0 is exactly the historical path.
+            if a.class_weight_beta > 0:
+                # A relabelled target is a distribution. Weight its retained
+                # given-label mass too, rather than using only the teacher pick.
+                w = w * (mix_t * class_weights[None, :]).sum(1)
                 if a.norm_weights:
-                    # keep the effective step size stable as filtering kicks in
                     w = w / w.mean().clamp_min(1e-6)
 
             # labelled pass on both views (the "passive" term)
@@ -717,8 +1508,31 @@ def main(a):
             if not warm and a.robust_weight > 0:
                 rob = 0.5 * (robust(out, mix_t) + robust(out2, mix_t))
                 loss = loss + a.robust_weight * (w * rob).mean()
+            if a.class_margin > 0 and not warm:
+                # Hard margins on uncertain/mixed labels can amplify noise.
+                # Use only retained given labels whose online EMA agrees; the
+                # rest still receives the historical CE and robust objectives.
+                trusted_margin = ((hard == y) & (tprob.argmax(1) == y) &
+                                  (tprob.max(1).values >= a.class_margin_conf))
+                ml = 0.5 * (class_margin_loss(out, hard, margins[hard]) +
+                            class_margin_loss(out2, hard, margins[hard]))
+                loss = loss + a.class_margin_weight * (w * trusted_margin * ml).mean()
+                margin_seen += bsz
+                margin_eligible += int(trusted_margin.sum())
+                margin_active += int((trusted_margin & (ml.detach() > 0)).sum())
+            if semantic_distance is not None and not warm:
+                trusted_semantic = ((hard == y) & (tprob.argmax(1) == y) &
+                                    (tprob.max(1).values >= a.semantic_conf))
+                sl = .5 * (expected_semantic_cost(out, y, semantic_distance) +
+                           expected_semantic_cost(out2, y, semantic_distance))
+                weighted_semantic = (w * trusted_semantic * sl).mean()
+                loss = loss + a.semantic_weight * weighted_semantic
+                semantic_sum += float(weighted_semantic.detach()) * bsz
+                semantic_eligible += int(trusted_semantic.sum())
             if a.consistency_weight > 0:
-                loss = loss + a.consistency_weight * F.mse_loss(z, z2.detach())
+                consistency = view_consistency(z, z2, a.consistency_mode)
+                loss = loss + a.consistency_weight * consistency
+                consistency_sum += float(consistency.detach()) * bsz
             if anchor is not None and a.anchor_weight > 0:
                 loss = loss + a.anchor_weight * (1 - (z * anchor).sum(1)).mean()
             if a.proto_weight > 0 and not warm:
@@ -759,16 +1573,58 @@ def main(a):
             print(f'prototypes seeded from frozen CLIP for {int(present.sum())}/{nclass} classes')
 
         sched.step()
-        vl, va_acc, va_hi = evaluate(model, vloader, device, amp_dtype, use_amp)
-        score = va_acc if a.select == 'val_acc' else va_hi
+        vl, va_acc, va_hi, va_macro, va_tail, va_balanced, va_recall, va_n = evaluate(
+            model, vloader, device, amp_dtype, use_amp, nclass, class_counts)
+        metrics = {'val_acc': va_acc, 'val_acc_hi': va_hi, 'val_macro': va_macro,
+                   'val_tail': va_tail, 'val_balanced': va_balanced}
+        score = metrics[a.select]
         t_acc = t_acc_hi = 0.0
         if a.save_teacher:
             # A second pass over the same hold-out. `evaluate` only reads, and the
             # next epoch re-enters with `model.train()`, so the student is unaffected.
-            _, t_acc, t_acc_hi = evaluate(teacher, vloader, device, amp_dtype, use_amp)
+            _, t_acc, t_acc_hi, t_macro, t_tail, t_balanced, _, _ = evaluate(
+                teacher, vloader, device, amp_dtype, use_amp, nclass, class_counts)
         print(f'epoch {ep + 1}/{a.epochs} loss={running / max(seen, 1):.4f} '
               f'val_loss={vl:.4f} val_acc={va_acc:.4f} val_acc_hi={va_hi:.4f} '
+              f'val_macro={va_macro:.4f} val_tail={va_tail:.4f} '
+              f'val_balanced={va_balanced:.4f} '
               f'lr={opt.param_groups[0]["lr"]:.2e} time={time.time() - t0:.1f}s')
+        if a.consistency_weight > 0:
+            print(f'  [consistency] mode={a.consistency_mode} '
+                  f'raw={consistency_sum / max(seen, 1):.6f} '
+                  f'weighted={a.consistency_weight * consistency_sum / max(seen, 1):.6f}')
+        with torch.no_grad():
+            print(f'  [head] scale={float(model.head.logit_scale.exp().clamp(1, 100)):.4f}'
+                  + (f' local_gate={float(torch.tanh(model.local_head.gate)):.6f}'
+                     if model.local_head is not None else ''))
+            tau = model.attn_temperature()
+            if tau is not None:
+                print(f'  [attn-temp] tau min={float(tau.min()):.4f} '
+                      f'mean={float(tau.mean()):.4f} max={float(tau.max()):.4f} (init 1.0, '
+                      f'{tau.numel()} heads)')
+        if margin_seen:
+            print(f'  [margin] eligible={margin_eligible}/{margin_seen} '
+                  f'active={margin_active}/{margin_seen}')
+        if semantic_distance is not None:
+            print(f'  [semantic] eligible={semantic_eligible}/{seen} '
+                  f'weighted={a.semantic_weight * semantic_sum / max(seen, 1):.6f}')
+        # Class-level report from the fixed training hold-out only.  It is a
+        # diagnostic of where the current model is weak, not a selection input
+        # and never reads the test set.
+        nz = va_n > 0
+        if bool(nz.any()):
+            smoothed = (va_recall + 1.0 / va_n.clamp_min(1).float()) / (1.0 + 2.0 / va_n.clamp_min(1).float())
+            order = torch.argsort(torch.where(nz, smoothed, torch.ones_like(smoothed)))
+            idx_to_class = {i: c for c, i in tr.class_to_idx.items()}
+            shown = [i for i in order.tolist() if bool(nz[i])][:5]
+            print('  [classes] weakest: ' + ', '.join(
+                f'{idx_to_class[int(i)]}(n={int(va_n[i])},r={float(va_recall[i]):.3f})'
+                for i in shown))
+            with (out_dir / f'val_classes_ep{ep + 1}.csv').open('w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['class', 'train_count', 'val_count', 'recall'])
+                writer.writerows((idx_to_class[i], class_counts[i], int(va_n[i]), float(va_recall[i]))
+                                 for i in range(nclass))
         if a.save_teacher:
             print(f'  [teacher] val_acc={t_acc:.4f} val_acc_hi={t_acc_hi:.4f}'
                   f'   (student {va_acc:.4f} / {va_hi:.4f})')
@@ -776,19 +1632,18 @@ def main(a):
         ck = {'model': model.trainable_state_dict(), 'classes': tr.class_to_idx,
               'class_counts': class_counts,
               'args': vars(a), 'epoch': ep, 'val_acc': va_acc, 'val_acc_hi': va_hi,
+              'val_macro': va_macro, 'val_tail': va_tail, 'val_balanced': va_balanced,
               'lora_rank': a.lora_rank, 'lora_target': a.lora_target, 'pretrained': a.pretrained,
-              'model_name': a.model,
+              'lora_alpha': a.lora_alpha, 'lora_qkv': bool(a.lora_qkv),
+              'train_ln': bool(a.train_ln), 'attn_temp': bool(a.attn_temp),
+              'model_name': a.model, 'local_head': bool(a.local_head),
+              'junk_w': junk_w, 'junk_report': junk_report,
               'optim': opt.state_dict(), 'sched': sched.state_dict(), 'tracker': tracker.state_dict(),
               'rng': {'torch': torch.get_rng_state(),
                       'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
                       'python': random.getstate()}}
         torch.save(ck, out_dir / 'last.pt')
         if a.save_every and (ep + 1) % a.save_every == 0:
-            # The hold-out split carries the same *structured* label noise as the
-            # training set, so `val_acc` can be improved by memorising that noise
-            # -- which costs accuracy on the clean test set.  Keep snapshots so
-            # several epochs can be scored on the real leaderboard and the best
-            # one picked, instead of trusting a proxy that rewards the failure.
             torch.save(thin(ck), out_dir / f'ep{ep + 1}.pt')
         if a.save_teacher:
             # Reuse the student's key set rather than `teacher.trainable_state_dict()`:
@@ -800,6 +1655,7 @@ def main(a):
             tck['model'] = {k: v for k, v in teacher.state_dict().items()
                             if k in ck['model']}
             tck['val_acc'], tck['val_acc_hi'] = t_acc, t_acc_hi
+            tck['val_macro'], tck['val_tail'], tck['val_balanced'] = t_macro, t_tail, t_balanced
             thin_t = thin(tck)
             if a.save_every and (ep + 1) % a.save_every == 0:
                 torch.save(thin_t, out_dir / f'teacher_ep{ep + 1}.pt')
@@ -835,13 +1691,17 @@ def parse_args(argv=None):
     p.add_argument('--amp', default='bf16', choices=['bf16', 'fp16', 'none'])
     p.add_argument('--val-ratio', type=float, default=0.1)
     p.add_argument('--limit-batches', type=int, default=0, help='smoke test: stop after N steps')
-    p.add_argument('--sampler', default='balanced', choices=['balanced', 'uniform'])
-    p.add_argument('--select', default='val_acc', choices=['val_acc', 'val_acc_hi'])
+    p.add_argument('--sampler', default='balanced', choices=['balanced', 'uniform', 'shuffle'],
+                   help='balanced/uniform sample with replacement; shuffle covers each training item once')
+    p.add_argument('--split-seed', type=int, default=None,
+                   help='hold-out membership seed, independent of optimisation seed; defaults to --seed')
+    p.add_argument('--optimizer-groups', choices=['historical', 'no_decay_small'], default='historical',
+                   help='optional zero decay for scalar/bias/position/norm tensors')
+    p.add_argument('--select', default='val_acc',
+                   choices=['val_acc', 'val_acc_hi', 'val_macro', 'val_tail', 'val_balanced'],
+                   help='checkpoint metric computed only on the fixed training hold-out split')
     p.add_argument('--save-every', type=int, default=4, dest='save_every',
-                   help='also keep epN.pt every N epochs (0 = only best/last). The hold-out '
-                        'split shares the training set\'s label noise, so val_acc can be '
-                        'raised by memorising that noise -- snapshots let the real '
-                        'leaderboard pick the epoch instead.')
+                   help='also keep epN.pt every N epochs (0 = only best/last)')
 
     p.add_argument('--save-teacher', action='store_true', dest='save_teacher',
                    help='also evaluate the EMA teacher each epoch and snapshot it as '
@@ -854,6 +1714,55 @@ def parse_args(argv=None):
 
     p.add_argument('--lora-rank', type=int, default=8)
     p.add_argument('--lora-target', default='all', choices=['all', 'mlp'])
+
+    p.add_argument('--lora-qkv', action='store_true', dest='lora_qkv',
+                   help='also adapt each attention block\'s fused qkv projection.  '
+                        'nn.MultiheadAttention keeps query/key/value in a bare '
+                        'nn.Parameter, which the nn.Linear walk never sees, so the '
+                        'projection that shapes q/k/v has been frozen in every run so '
+                        'far -- worth (768+2304)x12 = 36,864 parameters per rank, a '
+                        'third on top of the 110,592 the sweep already touches.  Off '
+                        'by default: with it off the module tree is bit-identical to '
+                        'the runs that produced 71.2023 / 72.2733.')
+    p.add_argument('--lora-alpha', type=float, default=0.0, dest='lora_alpha',
+                   help='LoRA alpha; the update is scaled by alpha/rank, so this sets '
+                        'the adapter\'s effective step size.  0 (default) means '
+                        '2*rank, i.e. scale 2 -- the value every run so far used, and '
+                        'the only reason a rank sweep compares like for like.  Raise '
+                        'it to make a given rank act stronger.')
+    p.add_argument('--attn-temp', action='store_true', dest='attn_temp',
+                   help='give every attention head its own learnable softmax temperature '
+                        'tau_h = exp(rho_h), rho_h initialised to zero.  Folded into the '
+                        'query rows of the fused qkv projection before '
+                        'F.multi_head_attention_forward, so at step 0 the multiplication is '
+                        'by exactly 1.0 and the model is bit-for-bit the run without the '
+                        'flag -- a clean single variable.  Costs 12x12 = 144 parameters.  '
+                        'Why: attention temperature is a first-order property of a '
+                        'transferred ViT (Zou et al., NeurIPS 2024), our own --local-head '
+                        'result (+0.0641) shows the CLS-only attention is a real weakness, '
+                        'and the project\'s measured conversion law (placement 2.19 vs '
+                        'capacity 0.18) says a new placement beats more rank.  The learning '
+                        'rate / weight decay are shared with the rest of the model ('
+                        'rho is 1-D, so --optimizer-groups no_decay_small puts it in the '
+                        'no-decay group).  Requires the rebuilt attention block, so it '
+                        'implies the custom attention path even without --lora-qkv.  Off by '
+                        'default: with it off the module tree and every number are exactly '
+                        'the historical ones.')
+    p.add_argument('--train-ln', action='store_true', dest='train_ln',
+                   help='also make the vision tower\'s LayerNorm gains/biases '
+                        'trainable (39,936 parameters).  Net() freezes them along with '
+                        'the rest of the backbone, so a LoRA-only run can rescale a '
+                        'sublayer but never re-centre it.  Still parameter-efficient '
+                        'fine-tuning of the official weights (rule 五.2), and it does '
+                        'not change which backbone is built.  Off by default.')
+
+    p.add_argument('--local-head', action='store_true', dest='local_head',
+                   help='pool the frozen tower\'s final spatial tokens through a tiny '
+                        'trainable adapter and add them to the global CLIP embedding '
+                        'with a zero-initialised gate.  It is still one backbone and one '
+                        'final classifier, not an ensemble.  Off by default: with it off '
+                        'the forward pass is exactly the historical global-only path, so '
+                        'existing checkpoints and results are bit-unaffected.')
 
     p.add_argument('--crop-min', type=float, default=0.55)
     p.add_argument('--train-pos-embed', action='store_true', dest='train_pos_embed',
@@ -868,7 +1777,7 @@ def parse_args(argv=None):
                         'the trained one and there is nothing to fix.')
     p.add_argument('--img-size', type=int, default=224, dest='img_size',
                    help='input resolution. Must be a multiple of ViT-B/32\'s patch size '
-                        '32: 224, 256, 288, 320, 352. The positional grid is bicubically '
+                        '32: 224, 256, 288, 320, 352, 384, 416. The positional grid is bicubically '
                         'resampled to match (open_clip does not do this itself). '
                         '336 is NOT legal -- it belongs to CLIP ViT-L/14. Training and '
                         'inference must agree; infer.py reads this back from the '
@@ -905,14 +1814,91 @@ def parse_args(argv=None):
     p.add_argument('--conf-floor', type=float, default=0.1)
     p.add_argument('--norm-weights', type=int, default=1)
 
+    p.add_argument('--class-weight-beta', type=float, default=0.0,
+                   help='bounded inverse-frequency loss factor; 0 keeps the '
+                        'historical recipe unchanged')
+    p.add_argument('--class-weight-min', type=float, default=0.5)
+    p.add_argument('--class-weight-max', type=float, default=2.0)
+    p.add_argument('--class-margin', type=float, default=0.0,
+                   help='optional target-vs-rival logit margin regulariser')
+    p.add_argument('--class-margin-weight', type=float, default=0.1)
+    p.add_argument('--class-margin-power', type=float, default=0.0,
+                   help='frequency exponent for bounded tail margins (e.g. 0.25); 0 is uniform')
+    p.add_argument('--class-margin-conf', type=float, default=0.5,
+                   help='EMA agreement confidence required for the optional margin regulariser')
+
     p.add_argument('--ema', type=float, default=0.995)
     p.add_argument('--anchor-weight', type=float, default=0.1)
+    p.add_argument('--fixed-anchor', action='store_true',
+                   help='anchor with initial official positional/LayerNorm tensors; '
+                        'off retains the historical moving backbone anchor')
     p.add_argument('--consistency-weight', type=float, default=0.05)
+    p.add_argument('--consistency-mode', choices=['mse', 'cosine'], default='mse',
+                   help='mse retains the historical dimension-averaged detached target; '
+                        'cosine gives dimension-independent symmetric gradients')
+    p.add_argument('--semantic-reference', default='',
+                   help='training-only frozen-CLIP prototype artifact from build_semantic_reference.py')
+    p.add_argument('--semantic-weight', type=float, default=0.0,
+                   help='expected semantic-distance regulariser; default off')
+    p.add_argument('--semantic-conf', type=float, default=0.5,
+                   help='EMA given-label agreement confidence for semantic penalty')
     p.add_argument('--proto-weight', type=float, default=0.5)
     p.add_argument('--proto-temp', type=float, default=0.1)
     p.add_argument('--proto-momentum', type=float, default=0.99)
     p.add_argument('--proto-min-weight', type=float, default=0.5)
-    return p.parse_args(argv)
+
+    # --- junk / duplicate screening of the training set (rule 五.2, 五.6: automatic only)
+    p.add_argument('--junk-filter', choices=['off', 'margin', 'dedup', 'both'], default='off',
+                   help='down-weight 杂图 / 重复图 using one deterministic frozen-CLIP pass over '
+                        'the training split, before epoch 1.  "margin": the frozen tower prefers '
+                        'another robust class centroid for this image (this is what catches a '
+                        'water-heater photo sitting in the bluebird folder -- the class folders '
+                        'are English search keywords, so every folder has some).  "dedup": some '
+                        'earlier sample is within --junk-dedup-tau cosine, i.e. a near-duplicate '
+                        'cluster, of which only the first index is kept.  Demotion only: samples '
+                        'are never deleted, relabelled or reordered, because that would desync '
+                        'the sampler schedule and every tracker index.  off = byte-identical to '
+                        'the historical path.')
+    p.add_argument('--junk-max-frac', type=float, default=0.05,
+                   help='hard cap on the fraction of the training split the filter may touch, '
+                        'most extreme offenders first.  This is the primary control, not a '
+                        'safety net: the strength of this filter has never been calibrated on '
+                        'this dataset, and the log prints the margin quantiles so the next run '
+                        'can choose a bigger cap with evidence.  Bear in mind --tau-conf 0.8 '
+                        'once pinned a 40%% cap on every epoch of a full run.')
+    p.add_argument('--junk-floor', type=float, default=0.2,
+                   help='weight given to a flagged sample (1.0 = no effect).  Nothing is set to '
+                        'zero: a zero weight is indistinguishable from deletion for the gradient, '
+                        'but harder to notice in the log.')
+    p.add_argument('--junk-dedup-tau', type=float, default=0.98,
+                   help='frozen-feature cosine above which two files count as the same picture. '
+                        'A hard verdict rather than a tuned one -- no two genuinely different '
+                        'fine-grained images reach 0.98.')
+    p.add_argument('--junk-centroid-rounds', type=int, default=2,
+                   help='re-estimation rounds for the robust class centroids; round 1 is the '
+                        'plain folder mean, each later round re-averages over the samples whose '
+                        'given label already is the nearest centroid.')
+    a = p.parse_args(argv)
+    if not 0 <= a.class_weight_beta <= 1:
+        p.error('--class-weight-beta must lie in [0, 1]')
+    if not 0 < a.class_weight_min <= 1 <= a.class_weight_max:
+        p.error('class weight bounds must satisfy 0 < min <= 1 <= max')
+    if min(a.class_margin, a.class_margin_weight, a.class_margin_power) < 0:
+        p.error('class margin parameters must be nonnegative')
+    if not 0 <= a.class_margin_conf <= 1:
+        p.error('--class-margin-conf must lie in [0, 1]')
+    if a.semantic_weight < 0 or not 0 <= a.semantic_conf <= 1:
+        p.error('semantic weight must be nonnegative and confidence in [0, 1]')
+    if a.junk_filter != 'off':
+        if not 0 <= a.junk_max_frac <= 1:
+            p.error('--junk-max-frac must lie in [0, 1]')
+        if not 0 <= a.junk_floor <= 1:
+            p.error('--junk-floor must lie in [0, 1]')
+        if not -1 <= a.junk_dedup_tau <= 1:
+            p.error('--junk-dedup-tau must be a cosine in [-1, 1]')
+        if a.junk_centroid_rounds < 0:
+            p.error('--junk-centroid-rounds must be nonnegative')
+    return a
 
 
 if __name__ == '__main__':

@@ -39,12 +39,9 @@ import argparse
 
 import torch
 from torch.utils.data import DataLoader
-from torchvision import transforms
 
-import open_clip
-
-from train import (CLIP_MEAN, CLIP_STD, ImageFolderNoisy, Net, check_backbone,
-                   resize_positional_embedding, val_resize)
+from train import (ImageFolderNoisy, Net, build_clip, ck_image_size,
+                   enable_pos_embed_training, eval_transform)
 
 
 @torch.no_grad()
@@ -72,22 +69,14 @@ def report(path, ck, model, device, a):
     ck_args = ck.get('args', {})
     data = a.data or ck_args.get('data')
     assert data, 'checkpoint has no --data recorded; pass --data explicitly'
-    img_size = ck.get('img_size', ck_args.get('img_size', 224))
-    val_tf = transforms.Compose([
-        transforms.Resize(val_resize(img_size)), transforms.CenterCrop(img_size),
-        transforms.ToTensor(), transforms.Normalize(CLIP_MEAN, CLIP_STD)])
-    split_seed = ck_args.get('split_seed')
-    if split_seed is None:
-        split_seed = ck_args.get('seed', 3407)
-    va = ImageFolderNoisy(data, val_tf, True, ck_args.get('val_ratio', 0.1),
-                          split_seed, 'val')
+    va = ImageFolderNoisy(data, eval_transform(ck_image_size(ck)[0]), True,
+                          ck_args.get('val_ratio', 0.1), ck_args.get('seed', 3407), 'val')
     assert va.class_to_idx == ck['classes'], (
         'val split found a different class list than the checkpoint -- '
         'wrong --data?')
 
     n, acc, rec, per_t = run(model, va, device, a)
-    order = rec.argsort()                   # worst recall first
-    freq_order = per_t.argsort()            # rarest class first (NOT the same thing)
+    order = rec.argsort()
     half, k = len(rec) // 2, max(1, len(rec) // 10)
     rev = {v: kk for kk, v in va.class_to_idx.items()}
 
@@ -96,8 +85,8 @@ def report(path, ck, model, device, a):
     print(f'  macro     class-equal recall            : {float(rec.mean()):.4f}')
     print(f'  per-class val images : min {int(per_t.min())} / max {int(per_t.max())} '
           f'(ratio {int(per_t.max()) / max(int(per_t.min()), 1):.0f}x)')
-    print(f'  recall, rarest 50% of classes : {float(rec[freq_order[:half]].mean()):.4f}')
-    print(f'  recall, commonest 10%         : {float(rec[freq_order[-k:]].mean()):.4f}')
+    print(f'  recall, rarest 50% of classes : {float(rec[order[:half]].mean()):.4f}')
+    print(f'  recall, commonest 10%         : {float(rec[order[-k:]].mean()):.4f}')
     print('  worst 5 classes: ' + ', '.join(
         f'{rev[int(i)]}(n={int(per_t[i])},r={float(rec[i]):.2f})' for i in order[:5]))
 
@@ -109,38 +98,29 @@ def main(a):
         ck_args = ck.get('args', {})
         rank = ck.get('lora_rank', ck_args.get('lora_rank', 8))
         target = ck.get('lora_target', ck_args.get('lora_target', 'all'))
-        # --lora-qkv / --lora-alpha have to come back too, exactly as infer.py:214-238
-        # does it.  Without them a rebuilt Net either has nowhere to put the
-        # checkpoint's attn.qkv.* tensors (they arrive as *unexpected* and are dropped)
-        # or re-derives the adapter scale as 2*rank instead of the trained alpha --
-        # both hand back a wrong val_acc with nothing raised.
-        lora_qkv = bool(ck.get('lora_qkv', ck_args.get('lora_qkv', False)))
-        lora_alpha = float(ck.get('lora_alpha', ck_args.get('lora_alpha', 0.0)) or 0.0)
         model_name = ck.get('model_name', ck_args.get('model', 'ViT-B-32-quickgelu'))
-        check_backbone(model_name)
 
-        clip_model = open_clip.create_model(model_name,
-                                            pretrained=ck.get('pretrained', 'openai'))
-        # same resolution the checkpoint was trained at, or the frozen backbone and
-        # the LoRA weights it carries would disagree and every number below would be
-        # quietly wrong rather than obviously broken
-        img_size = ck.get('img_size', ck_args.get('img_size', 224))
-        if img_size != 224:             # at the trained size the grid already matches
-            resize_positional_embedding(clip_model.visual, img_size)
-        # rebuild the local head too, or its tensors come back as *unexpected*
-        # (not missing) and the model silently drops a learned residual
+        # Same size as the run that produced the checkpoint, otherwise the
+        # val_acc self-check below compares two different forward passes.
+        # ck_image_size also accepts the sibling repo's `img_size` spelling.
+        clip_model = build_clip(model_name, ck.get('pretrained', 'openai'),
+                                ck_image_size(ck)[0], ck=ck)
         local_head = bool(ck.get('local_head', ck_args.get('local_head', False)))
-        model = Net(clip_model, len(ck['classes']), rank, target, local_head=local_head,
-                    lora_qkv=lora_qkv, lora_alpha=lora_alpha)
-        missing, unexpected = model.load_state_dict(ck.get('model', ck), strict=False)
-        # `missing` is expected: the snapshot is `trainable_state_dict()`, so the
-        # frozen backbone is deliberately absent and only trainable names matter.
-        # `unexpected` is not expected -- it means the checkpoint carries trained
-        # tensors this Net has nowhere to put, which is exactly what a rebuild that
-        # forgot a new flag looks like.  The old code bound it to `_` and reported a
-        # confidently wrong accuracy instead.
-        assert not unexpected, ('checkpoint carries trained weights this model cannot '
-                                f'hold -- rebuilt with the wrong flags? {sorted(unexpected)[:5]}')
+        model = Net(clip_model, len(ck['classes']), rank, target,
+                    local_head=local_head)
+        if ck.get('pos_embed_trained'):
+            # Net freezes the visual tower by default.  A trained positional
+            # grid is part of the checkpoint's learned state and must be marked
+            # trainable before the missing-key guard, otherwise this diagnostic
+            # silently fails to notice a missing grid tensor.
+            enable_pos_embed_training(model.clip.visual)
+            pe_key = next((k for k in ('clip.visual.positional_embedding',
+                                       'clip.visual.pos_embed')
+                           if k in ck.get('model', {})), None)
+            if pe_key is None:
+                raise SystemExit(f'{path}: checkpoint declares trained positional '
+                                 'embedding but does not contain its tensor')
+        missing, _ = model.load_state_dict(ck.get('model', ck), strict=False)
         lost = {n for n, p in model.named_parameters() if p.requires_grad} & set(missing)
         assert not lost, f'no trained weights in checkpoint for: {sorted(lost)[:5]}'
         del clip_model

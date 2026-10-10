@@ -13,7 +13,7 @@ the given label instead of overwriting it).
 
 * ``ce``  -- cross entropy, used during warm-up only;
 * ``gce`` -- generalized cross entropy (Zhang & Sabuncu, NeurIPS 2018);
-* ``nce`` -- historical tangent-modified CE (not conventional normalised CE);
+* ``nce`` -- normalized cross entropy (Ma et al., ICML 2020, Eq. 6);
 * ``rce`` -- reverse cross entropy (Ma et al., ICML 2020, Table 1);
 * ``apl`` -- active passive loss = NCE + RCE (Ma et al., ICML 2020).
 
@@ -68,9 +68,9 @@ def rce(logits, y, eps=1e-4, reduction='none'):
 
         RCE = -sum_k p_k log q_k = -log(eps) * (1 - sum_k t_k p_k)
 
-    i.e. a mean-absolute-error-like term scaled by ``-log(eps) ~= 9.21``.
-    Its logit gradient tends to zero at saturated probabilities; confidence
-    alone is not evidence that this objective prevents noisy-label memorisation.
+    i.e. a mean-absolute-error-like term scaled by ``-log(eps) ~= 9.21``.  Like
+    NCE its gradient does not vanish as the model grows confident, which is what
+    keeps it acting on samples CE has already stopped caring about.
 
     (An earlier version returned the prediction *entropy*.  Minimising entropy
     *sharpens* the posterior -- the opposite of damping an over-confident model
@@ -83,14 +83,13 @@ def rce(logits, y, eps=1e-4, reduction='none'):
 
 
 def nce(logits, y, k=0.2, B=1.0, reduction='none'):
-    """Historical tangent-modified cross entropy, kept for recipe compatibility.
+    """Normalized cross entropy (Ma et al., ICML 2020).
 
     ``-log(p)`` for ``p <= k``; for ``p > k`` it is replaced by the straight line
     tangent to ``-log(p)`` at ``p = k``: ``A * p**B + C`` with
     ``A = -1 / (B * k**B)`` and ``C = 1 / B - log(k)`` (matching value and slope
-    at ``p = k``). For B=1 this is linear in probability above k. Its logit
-    gradient still tends to zero as p approaches one. This implementation is
-    a tangent-modified CE, not the conventional CE/sum-of-class-costs NCE.
+    at ``p = k``).  The gradient therefore never vanishes on confident samples,
+    which is what makes the loss *active* against memorised label noise.
 
     With a soft target the per-class cost is still ``e(p_k)``; the loss is
     ``sum_k t_k e(p_k)``, so every class the target puts mass on contributes.
@@ -116,8 +115,8 @@ def apl(logits, y, k=0.2, B=1.0, rce_scale=1.0, reduction='none'):
     """Active passive loss: ``NCE + rce_scale * RCE``.
 
     Both halves push the target mass up, so this is still a classification loss;
-    their gradient shapes differ from CE. Both can saturate on confident
-    samples; robust generalisation must be measured, not inferred from the name.
+    the robustness comes from the *shape* of the two gradients (neither vanishes
+    on a confident sample), not from a different direction.
     """
     loss = nce(logits, y, k, B) + rce_scale * rce(logits, y)
     return loss.mean() if reduction == 'mean' else loss

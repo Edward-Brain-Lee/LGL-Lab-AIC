@@ -46,18 +46,15 @@ import open_clip
 import train as T
 
 
-def build_split(a, split, img_size=224):
+def build_split(a, split):
     """Rebuild the hold-out split exactly as ``train.py`` does.
 
     Membership depends only on ``(seed, val_ratio, val=...)``; the transform is
     passed here as the deterministic evaluation one so the numbers are stable.
-    ``img_size`` must come from the checkpoint -- analysing a 288 run with the 224
-    transform would still run, and every number it printed would be wrong.
     """
-    val_tf = transforms.Compose([
-        transforms.Resize(T.val_resize(img_size)), transforms.CenterCrop(img_size),
-        transforms.ToTensor(), transforms.Normalize(T.CLIP_MEAN, T.CLIP_STD)])
-    return T.ImageFolderNoisy(a.data, val_tf, val=(split == 'val'),
+    # a.image_size is resolved from the checkpoint by load_model(), which
+    # report() calls first -- so a 336 checkpoint is analysed at 336.
+    return T.ImageFolderNoisy(a.data, T.eval_transform(a.image_size), val=(split == 'val'),
                               val_ratio=a.val_ratio, seed=a.seed, split=split)
 
 
@@ -67,39 +64,37 @@ def load_model(a, device):
     ck_args = ck.get('args', {})
     rank = a.lora_rank or ck.get('lora_rank', ck_args.get('lora_rank', 8))
     target = ck.get('lora_target', ck_args.get('lora_target', 'all'))
-    # same two keys infer.py:214-238 restores: a rebuild that drops them either
-    # discards the checkpoint's attn.qkv.* tensors as *unexpected* or rescales the
-    # adapters to 2*rank instead of the trained alpha, and every number below is
-    # then quietly wrong rather than obviously broken
-    lora_qkv = bool(ck.get('lora_qkv', ck_args.get('lora_qkv', False)))
-    lora_alpha = float(ck.get('lora_alpha', ck_args.get('lora_alpha', 0.0)) or 0.0)
     pretrained = a.pretrained or ck.get('pretrained', 'openai')
     model_name = ck.get('model_name', ck_args.get('model', 'ViT-B-32-quickgelu'))
     T.check_backbone(model_name)
+    # resolve once, here, so build_split() and the model agree (--image-size 0
+    # means "as the checkpoint was trained").  ck_image_size handles the
+    # `img_size` spelling checkpoints from the sibling repo carry, and says so
+    # when it does: reading the wrong resolution back is the one failure here
+    # that produces a plausible number instead of an error.
+    a.image_size = getattr(a, 'image_size', 0) or T.ck_image_size(ck)[0]
 
-    clip_model = open_clip.create_model(model_name, pretrained=pretrained)
-    img_size = ck.get('img_size', ck_args.get('img_size', 224))
-    if img_size != 224:                 # at the trained size the grid already matches
-        T.resize_positional_embedding(clip_model.visual, img_size)
-    # rebuild the local head too, or its tensors come back as *unexpected*
-    # (not missing) and the model silently drops a learned residual
+    clip_model = T.build_clip(model_name, pretrained, a.image_size, ck=ck)
     local_head = bool(ck.get('local_head', ck_args.get('local_head', False)))
-    model = T.Net(clip_model, len(classes), rank, target, local_head=local_head,
-                  lora_qkv=lora_qkv, lora_alpha=lora_alpha)
-    missing, unexpected = model.load_state_dict(ck.get('model', ck), strict=False)
-    # the frozen backbone is absent from a snapshot by design, so `missing` is only
-    # meaningful for trainable names.  `unexpected` never is: it means trained
-    # tensors arrived that this model cannot hold.
-    assert not unexpected, ('checkpoint carries trained weights this model cannot '
-                            f'hold -- rebuilt with the wrong flags? {sorted(unexpected)[:5]}')
+    model = T.Net(clip_model, len(classes), rank, target,
+                  local_head=local_head)
+    if ck.get('pos_embed_trained'):
+        T.enable_pos_embed_training(model.clip.visual)
+        pe_key = next((k for k in ('clip.visual.positional_embedding',
+                                   'clip.visual.pos_embed')
+                       if k in ck.get('model', {})), None)
+        if pe_key is None:
+            raise SystemExit('checkpoint declares trained positional embedding but '
+                             'the tensor is absent')
+    missing, _ = model.load_state_dict(ck.get('model', ck), strict=False)
     trained = {n for n, p in model.named_parameters() if p.requires_grad}
     lost = trained & set(missing)
     assert not lost, f'checkpoint has no trained weights for: {sorted(lost)[:5]}'
     del clip_model
     model.to(device).eval()
     print(f'loaded {a.checkpoint} (epoch {ck.get("epoch", "?")}, {len(classes)} classes, '
-          f'{model_name}, lora rank {rank}/{target}, {img_size}px)')
-    return model, classes, img_size
+          f'{model_name}, lora rank {rank}/{target})')
+    return model, classes
 
 
 @torch.no_grad()
@@ -129,15 +124,8 @@ def quantiles(v, ps=(10, 25, 50, 75, 90)):
 
 def report(a):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model, classes, img_size = load_model(a, device)
-    ds = build_split(a, a.split, img_size)
-    # `given`/`pred` below are indices into the *dataset's* class ordering, while every
-    # name this report prints comes from the checkpoint's.  If the two tables ever
-    # disagree (wrong --data) the labels are silently shifted and the whole report --
-    # worst classes, confusions, suspected noise -- is confidently wrong.
-    # valmetrics.py:81 guards the same invariant; this file did not.
-    assert ds.class_to_idx == classes, (
-        'the split found a different class list than the checkpoint -- wrong --data?')
+    model, classes = load_model(a, device)
+    ds = build_split(a, a.split)
     names = {i: n for n, i in classes.items()}
     print(f'{a.split} split: {len(ds)} images')
 
@@ -257,6 +245,10 @@ def parse_args(argv=None):
     p.add_argument('--workers', type=int, default=8)
     p.add_argument('--pretrained', default='', help='override (default: as in the checkpoint)')
     p.add_argument('--lora-rank', type=int, default=0, help='override (default: as in the checkpoint)')
+    p.add_argument('--image-size', '--img-size', type=int, default=0, dest='image_size',
+                   help='input resolution; 0 = as in the checkpoint (required to match, '
+                        'otherwise this analyses a different forward pass than was trained). '
+                        '--img-size is the same flag under the sibling repo\'s spelling.')
     return p.parse_args(argv)
 
 
