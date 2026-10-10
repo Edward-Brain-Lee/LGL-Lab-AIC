@@ -84,8 +84,9 @@ def load_model(a, device):
     # rebuild the local head too, or its tensors come back as *unexpected*
     # (not missing) and the model silently drops a learned residual
     local_head = bool(ck.get('local_head', ck_args.get('local_head', False)))
+    local_attn = bool(ck.get('local_attn', ck_args.get('local_attn', False)))
     model = T.Net(clip_model, len(classes), rank, target, local_head=local_head,
-                  lora_qkv=lora_qkv, lora_alpha=lora_alpha)
+                  lora_qkv=lora_qkv, lora_alpha=lora_alpha, local_attn=local_attn)
     missing, unexpected = model.load_state_dict(ck.get('model', ck), strict=False)
     # the frozen backbone is absent from a snapshot by design, so `missing` is only
     # meaningful for trainable names.  `unexpected` never is: it means trained

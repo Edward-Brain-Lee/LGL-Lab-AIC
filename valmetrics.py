@@ -130,8 +130,9 @@ def main(a):
         # rebuild the local head too, or its tensors come back as *unexpected*
         # (not missing) and the model silently drops a learned residual
         local_head = bool(ck.get('local_head', ck_args.get('local_head', False)))
+        local_attn = bool(ck.get('local_attn', ck_args.get('local_attn', False)))
         model = Net(clip_model, len(ck['classes']), rank, target, local_head=local_head,
-                    lora_qkv=lora_qkv, lora_alpha=lora_alpha)
+                    lora_qkv=lora_qkv, lora_alpha=lora_alpha, local_attn=local_attn)
         missing, unexpected = model.load_state_dict(ck.get('model', ck), strict=False)
         # `missing` is expected: the snapshot is `trainable_state_dict()`, so the
         # frozen backbone is deliberately absent and only trainable names matter.

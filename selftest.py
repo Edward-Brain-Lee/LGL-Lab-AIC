@@ -736,6 +736,35 @@ def check_attn_temp():
     print('  attn-temp ok')
 
 
+def check_local_attention_and_schedule():
+    torch.manual_seed(0)
+    h, d, n = 8, 6, 5
+    base = train.LocalPatchHead(h, d, attentive=False)
+    attn = train.LocalPatchHead(h, d, attentive=True, attn_dim=4)
+    attn.proj.weight.data.copy_(base.proj.weight.data)
+    tokens = torch.randn(2, n, h)
+    # SimPool query/key pooling is intentionally non-uniform inside the local
+    # branch.  The externally gated Net must still be exactly the historical
+    # global path at step 0 (the production invariant).
+    assert attn.query_proj.weight.shape == (4, h)
+    assert attn.key_proj.weight.shape == (4, h)
+    assert torch.equal(attn.score.weight, torch.zeros_like(attn.score.weight))
+    assert torch.equal(attn.log_temp, torch.zeros_like(attn.log_temp))
+    assert torch.equal(attn.sim_scale, torch.ones_like(attn.sim_scale))
+    out = attn(tokens)
+    assert torch.isfinite(out).all()
+    out.sum().backward()
+    assert attn.query_proj.weight.grad is not None
+    assert attn.key_proj.weight.grad is not None
+    class A: pass
+    a = A(); a.loss_schedule = 'gce_apl'; a.epochs = 10; a.warmup_epochs = 2
+    lg, y = torch.randn(4, 5), torch.tensor([0, 1, 2, 3])
+    ce = losses.make_robust_loss('ce'); gce = losses.make_robust_loss('gce'); apl = losses.make_robust_loss('apl')
+    assert torch.allclose(train.scheduled_robust_loss(lg, y, 2, a, ce, gce, apl), gce(lg, y))
+    assert torch.allclose(train.scheduled_robust_loss(lg, y, 9, a, ce, gce, apl), apl(lg, y))
+    print('  local token attention zero-init and phased loss schedule ok')
+
+
 def check_junk_filter():
     """``--junk-filter``: frozen-tower screening of 杂图 and near-duplicates.
 
@@ -1268,6 +1297,7 @@ if __name__ == '__main__':
     check_lora()
     check_lora_qkv_and_ln()
     check_attn_temp()
+    check_local_attention_and_schedule()
     check_junk_filter()
     check_pos_embed_resize()
     check_train_pos_embed()

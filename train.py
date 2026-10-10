@@ -297,6 +297,30 @@ def view_consistency(z1, z2, mode='mse'):
     raise ValueError(f'unknown consistency mode {mode}')
 
 
+def scheduled_robust_loss(logits, target, epoch, args, fixed_loss,
+                          gce_loss=None, apl_loss=None):
+    """Return a per-sample robust objective for the selected training phase.
+
+    ``fixed`` is the historical single-loss path.  The two mixed schedules
+    deliberately ramp from a bounded/noise-tolerant objective to APL only after
+    warm-up, avoiding the early memorisation spike seen when APL is enabled
+    from the first noisy-label epoch.
+    """
+    mode = getattr(args, 'loss_schedule', 'fixed')
+    if mode == 'fixed':
+        return fixed_loss(logits, target)
+    if gce_loss is None or apl_loss is None:
+        raise RuntimeError('mixed loss schedule requires GCE and APL callables')
+    span = max(1, int(args.epochs) - int(args.warmup_epochs) - 1)
+    lam = (int(epoch) - int(args.warmup_epochs)) / span
+    lam = max(0.0, min(1.0, lam))
+    if mode == 'gce_apl':
+        return (1.0 - lam) * gce_loss(logits, target) + lam * apl_loss(logits, target)
+    if mode == 'ce_apl':
+        return (1.0 - lam) * xent(logits, target) + lam * apl_loss(logits, target)
+    raise ValueError(f'unknown loss schedule {mode}')
+
+
 def optimizer_groups(model, weight_decay, mode='historical'):
     """Opt-in no-decay scalar/position/norm group; keep historical path exact."""
     params = [p for p in model.parameters() if p.requires_grad]
@@ -599,8 +623,15 @@ class LocalPatchHead(nn.Module):
     inference time (no ensemble and no second backbone).
     """
 
-    def __init__(self, width, out_dim, base_proj=None):
+    def __init__(self, width, out_dim, base_proj=None, attentive=False,
+                 attn_heads=1, attn_dim=64):
         super().__init__()
+        self.attentive = bool(attentive)
+        # SimPool uses a full-dimensional query/key dot product.  Keep one
+        # compact head here: scalar-per-head projections are only a rank-H
+        # bilinear score and collapse under the local residual gate.
+        self.attn_heads = int(attn_heads)
+        self.attn_dim = int(attn_dim)
         self.proj = nn.Linear(width, out_dim, bias=False)
         # open_clip represents the visual projection as either a matrix
         # Parameter [width, out_dim] or (in some builds) an nn.Linear/
@@ -625,10 +656,58 @@ class LocalPatchHead(nn.Module):
         # A zero gate preserves the pretrained global representation at the
         # beginning of a run, while still giving the adapter a useful gradient.
         self.gate = nn.Parameter(torch.zeros(()))
+        # SimPool-style token attention: the residual gate outside this module
+        # starts at zero, so the complete model is unchanged at step 0.  The
+        # local branch itself uses a full-dimensional GAP query/token key score
+        # from its first forward pass and can learn to suppress background,
+        # watermarks and other low-value patches once the gate opens.
+        if self.attentive:
+            self.score = nn.Linear(width, self.attn_heads, bias=False)
+            nn.init.zeros_(self.score.weight)
+            self.log_temp = nn.Parameter(torch.zeros(self.attn_heads))
+            # SimPool-style data-dependent scores.  The pooled token is a
+            # global (GAP) query and each patch is a key.  The query/key
+            # projections are independently initialized and full-dimensional,
+            # avoiding the scalar-head symmetry of the earlier scorer.  The
+            # projections remain local to the pooling adapter; the CLIP tower
+            # is untouched.
+            self.query_proj = nn.Linear(width, self.attn_dim, bias=False)
+            self.key_proj = nn.Linear(width, self.attn_dim, bias=False)
+            nn.init.normal_(self.query_proj.weight, std=width ** -0.5)
+            nn.init.normal_(self.key_proj.weight, std=width ** -0.5)
+            # Unlike the old scalar multi-head branch, the SimPool score is
+            # live from step 0 inside the residual branch.  The outer gate is
+            # still zero, so the complete model remains exactly incumbent at
+            # initialization while Q/K receive useful gradients as soon as
+            # the gate moves.
+            self.sim_scale = nn.Parameter(torch.ones(self.attn_heads))
+        else:
+            self.score = None
+            self.log_temp = None
+            self.query_proj = None
+            self.key_proj = None
+            self.sim_scale = None
 
     def forward(self, tokens):
         # tokens are final, layer-normalised spatial tokens: [B, N, width]
-        pooled = tokens.mean(dim=1)
+        if self.score is None:
+            pooled = tokens.mean(dim=1)
+        else:
+            # [B, N, H] -> [B, H, N].  Head temperatures are positive and
+            # start at one; the outer residual gate controls the step-0 path.
+            scores = self.score(tokens).transpose(1, 2)
+            # SimPool query-key term.  The outer residual gate, rather than an
+            # artificial zero score, preserves the historical model at step 0.
+            query = self.query_proj(tokens.mean(dim=1))             # [B, D]
+            key = self.key_proj(tokens)                              # [B, N, D]
+            # tanh bounds the learned residual to [-1, 1], preventing an
+            # early noisy batch from making the pooling logits arbitrarily
+            # sharp (or numerically unstable).
+            sim = torch.einsum('bd,bnd->bn', query, key) / math.sqrt(self.attn_dim)
+            scores = scores + torch.tanh(self.sim_scale)[0] * sim[:, None, :]
+            scores = scores * self.log_temp.exp()[None, :, None]
+            weights = scores.softmax(dim=-1)
+            pooled = torch.einsum('bhn,bnd->bhd', weights, tokens).mean(dim=1)
         return F.normalize(self.proj(pooled).float(), dim=-1)
 
 
@@ -685,7 +764,8 @@ class ProtoHead(nn.Module):
 class Net(nn.Module):
     def __init__(self, clip_model, nclass, lora_rank=8, lora_target='all',
                  proto_momentum=0.99, proto_temp=0.1, local_head=False,
-                 lora_qkv=False, lora_alpha=0.0, attn_temp=False):
+                 lora_qkv=False, lora_alpha=0.0, attn_temp=False,
+                 local_attn=False):
         super().__init__()
         self.clip = clip_model
         dim = clip_model.visual.output_dim
@@ -695,6 +775,7 @@ class Net(nn.Module):
         # 2*rank every run so far used, which fixes the ratio at 2 whatever the rank
         alpha = lora_alpha if lora_alpha > 0 else 2 * lora_rank
         self.lora_alpha, self.lora_qkv, self.attn_temp = alpha, lora_qkv, attn_temp
+        self.local_attn = bool(local_attn)
         self.n_lora = add_lora(self.clip.visual, lora_rank, alpha,
                                target=lora_target, qkv=lora_qkv, attn_temp=attn_temp)
         self._anchor_names = {}
@@ -714,7 +795,8 @@ class Net(nn.Module):
                 # explicit instead of failing later with an obscure shape error.
                 raise SystemExit('local patch head requires a ViT visual transformer with a width')
             self.local_head = LocalPatchHead(int(width), int(dim),
-                                             getattr(visual, 'proj', None))
+                                             getattr(visual, 'proj', None),
+                                             attentive=local_attn)
 
     def forward(self, x, return_feat=False):
         if self.local_head is None:
@@ -1108,7 +1190,11 @@ def junk_weights(feat, targets, means, present, mode='both', dedup_tau=0.98,
             report['dup_cross'] = round(float((y[dup_arg[dup]] != y[dup]).float().mean()), 4)
         key = key + 2.0 * dup.float()          # a duplicate always outranks a margin flag
 
-    # ---- the cap.  Top `max_frac` of the split by severity, ties by index order.
+    # ---- the cap.  First impose a per-class quota, then apply the global quota.
+    # A pure global top-k can spend the entire budget on a few hard/noisy folders
+    # and silently erase their effective coverage.  The per-class quota keeps the
+    # demotion balanced while the global cap preserves the original intervention
+    # budget.
     cand = key > 0
     k = min(int(max_frac * n), int(cand.sum()))
     report['cap'] = k
@@ -1117,10 +1203,26 @@ def junk_weights(feat, targets, means, present, mode='both', dedup_tau=0.98,
         if verbose:
             print('  [junk] nothing crossed either rule; every sample keeps weight 1.0')
         return torch.ones(n), report
-    topk = torch.topk(key, k, largest=True, sorted=False).indices
+    counts = torch.bincount(y, minlength=nclass)
+    class_cap = torch.ceil(counts.float() * float(max_frac)).to(torch.long).clamp_min(1)
+    quota_mask = torch.zeros(n, dtype=torch.bool, device=z.device)
+    for c in range(nclass):
+        idx = torch.where(cand & (y == c))[0]
+        if idx.numel():
+            kc = min(int(class_cap[c]), int(idx.numel()))
+            chosen = idx[torch.topk(key[idx], kc, largest=True, sorted=False).indices]
+            quota_mask[chosen] = True
+    quota_idx = torch.where(quota_mask)[0]
+    if quota_idx.numel() > k:
+        topk = quota_idx[torch.topk(key[quota_idx], k, largest=True, sorted=False).indices]
+    else:
+        # Quotas can leave some of the global budget unused; that is intentional.
+        # Balanced coverage is safer than spending the remainder on a single
+        # difficult class.
+        topk = quota_idx
     w = torch.ones(n, device=z.device)
     w[topk] = float(floor)
-    report['flagged'] = k
+    report['flagged'] = int(topk.numel())
 
     # ---- per-class report: the risk of a filter is a class quietly emptied out
     n_class = torch.bincount(y, minlength=nclass).clamp_min(1)
@@ -1136,8 +1238,12 @@ def junk_weights(feat, targets, means, present, mode='both', dedup_tau=0.98,
         if mode in ('dedup', 'both'):
             print(f'  [junk] near-duplicates >{dedup_tau}: {report["dup"]} '
                   f'({report["dup_cross"]:.1%} of them across classes)')
-        print(f'  [junk] flagged {k}/{n} = {k / n:.2%} at weight {floor} '
-              f'(cap {max_frac:.1%}); mean weight {float(w.mean()):.4f}')
+        # report['flagged'], NOT k: with the per-class quota the final set can be
+        # smaller than the global budget (a class with few candidates cannot fill
+        # its own quota), and this line is what every downstream gate reads.
+        flagged = report['flagged']
+        print(f'  [junk] flagged {flagged}/{n} = {flagged / n:.2%} at weight {floor} '
+              f'(cap {max_frac:.1%}, budget {k}); mean weight {float(w.mean()):.4f}')
         if report['cap_bound']:
             print(f'  !! 警告: --junk-max-frac={max_frac} 顶死了 —— 判据想标记的样本比名额多，'
                   f'这次只处理了最极端的 {k} 个。要么接受，要么调大它（先看上面的分位数）。')
@@ -1205,7 +1311,7 @@ def evaluate(model, loader, device, amp_dtype, use_amp, nclass=None, class_count
 SNAPSHOT_KEYS = ('model', 'classes', 'class_counts', 'args', 'epoch', 'val_acc',
                  'val_macro', 'val_tail', 'val_balanced',
                  'val_acc_hi', 'lora_rank', 'lora_target', 'lora_alpha', 'lora_qkv',
-                 'train_ln', 'pretrained', 'model_name', 'local_head', 'attn_temp',
+                 'train_ln', 'pretrained', 'model_name', 'local_head', 'local_attn', 'attn_temp',
                  'junk_w', 'junk_report')
 
 
@@ -1276,7 +1382,7 @@ def main(a):
         print(f'img_size={a.img_size}: positional grid resampled to {grid}x{grid}')
     model = Net(clip_model, nclass, a.lora_rank, a.lora_target,
                 a.proto_momentum, a.proto_temp, a.local_head,
-                a.lora_qkv, a.lora_alpha, a.attn_temp).to(device)
+                a.lora_qkv, a.lora_alpha, a.attn_temp, a.local_attn).to(device)
     if a.train_pos_embed:
         # after Net() (which freezes the backbone) and before the optimiser / teacher
         n_pe = enable_pos_embed_training(model)
@@ -1305,6 +1411,8 @@ def main(a):
                                 w_relabel=a.w_relabel, max_noise_frac=a.max_noise_frac,
                                 relabel_mix=a.relabel_mix, device=device)
     robust = make_robust_loss(a.robust_loss, a.gce_q, a.apl_k, a.apl_b, a.apl_rce)
+    gce_robust = make_robust_loss('gce', a.gce_q, a.apl_k, a.apl_b, a.apl_rce)
+    apl_robust = make_robust_loss('apl', a.gce_q, a.apl_k, a.apl_b, a.apl_rce)
 
     opt = torch.optim.AdamW(optimizer_groups(model, a.weight_decay, a.optimizer_groups),
                             lr=a.lr, weight_decay=a.weight_decay)
@@ -1330,6 +1438,17 @@ def main(a):
                 f'--resume: the checkpoint {"carries" if ck_temp else "carries no"} attn_rho '
                 f'tensors but this run was started with --attn-temp={bool(a.attn_temp)}. '
                 f'Resuming would silently drop the temperatures.  Re-run with the same flag.')
+        ck_local_attn = bool(ck.get('local_attn', ck.get('args', {}).get('local_attn', False)))
+        if ck_local_attn != bool(a.local_attn):
+            raise SystemExit(
+                f'--resume: checkpoint local-attn={ck_local_attn} but this run has '
+                f'--local-attn={bool(a.local_attn)}; the local token scorer would be '
+                'missing or silently ignored.  Re-run with the matching flag.')
+        ck_schedule = ck.get('args', {}).get('loss_schedule', 'fixed')
+        if ck_schedule != a.loss_schedule:
+            raise SystemExit(
+                f'--resume: checkpoint loss-schedule={ck_schedule!r} but this run uses '
+                f'{a.loss_schedule!r}; resuming would change the objective mid-run.')
         # The junk weights are state, exactly like the tracker's: recomputing them on
         # resume would rebuild them from the *resumed* tower (which has drifted under
         # --train-pos-embed), and the run would quietly switch objectives mid-flight.
@@ -1506,7 +1625,9 @@ def main(a):
             ce2 = xent(out2, soft)
             loss = 0.5 * ((w * ce1).mean() + (w * ce2).mean())
             if not warm and a.robust_weight > 0:
-                rob = 0.5 * (robust(out, mix_t) + robust(out2, mix_t))
+                rob = 0.5 * (
+                    scheduled_robust_loss(out, mix_t, ep, a, robust, gce_robust, apl_robust) +
+                    scheduled_robust_loss(out2, mix_t, ep, a, robust, gce_robust, apl_robust))
                 loss = loss + a.robust_weight * (w * rob).mean()
             if a.class_margin > 0 and not warm:
                 # Hard margins on uncertain/mixed labels can amplify noise.
@@ -1637,6 +1758,7 @@ def main(a):
               'lora_alpha': a.lora_alpha, 'lora_qkv': bool(a.lora_qkv),
               'train_ln': bool(a.train_ln), 'attn_temp': bool(a.attn_temp),
               'model_name': a.model, 'local_head': bool(a.local_head),
+              'local_attn': bool(a.local_attn),
               'junk_w': junk_w, 'junk_report': junk_report,
               'optim': opt.state_dict(), 'sched': sched.state_dict(), 'tracker': tracker.state_dict(),
               'rng': {'torch': torch.get_rng_state(),
@@ -1763,6 +1885,12 @@ def parse_args(argv=None):
                         'final classifier, not an ensemble.  Off by default: with it off '
                         'the forward pass is exactly the historical global-only path, so '
                         'existing checkpoints and results are bit-unaffected.')
+    p.add_argument('--local-attn', action='store_true', dest='local_attn',
+                   help='replace local-head mean pooling with SimPool-style GAP-query '
+                        'and token-key attention.  The outer local residual gate is '
+                        'zero at step 0, so the complete model starts at the historical '
+                        'path and then learns to suppress background and junk patches. '
+                        'Requires --local-head.')
 
     p.add_argument('--crop-min', type=float, default=0.55)
     p.add_argument('--train-pos-embed', action='store_true', dest='train_pos_embed',
@@ -1786,6 +1914,9 @@ def parse_args(argv=None):
     p.add_argument('--randaug-m', type=int, default=9)
 
     p.add_argument('--robust-loss', default='apl', choices=['ce', 'gce', 'nce', 'rce', 'apl'])
+    p.add_argument('--loss-schedule', default='fixed', choices=['fixed', 'gce_apl', 'ce_apl'],
+                   help='phase-mix the robust term after warm-up: bounded GCE or CE '
+                        'ramps linearly into APL.  fixed preserves the historical recipe.')
     p.add_argument('--robust-weight', type=float, default=0.5)
     p.add_argument('--gce-q', type=float, default=0.7)
     p.add_argument('--apl-k', type=float, default=0.2)
@@ -1879,6 +2010,8 @@ def parse_args(argv=None):
                         'plain folder mean, each later round re-averages over the samples whose '
                         'given label already is the nearest centroid.')
     a = p.parse_args(argv)
+    if a.local_attn and not a.local_head:
+        p.error('--local-attn requires --local-head')
     if not 0 <= a.class_weight_beta <= 1:
         p.error('--class-weight-beta must lie in [0, 1]')
     if not 0 < a.class_weight_min <= 1 <= a.class_weight_max:

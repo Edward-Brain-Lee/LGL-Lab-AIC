@@ -103,12 +103,13 @@ def load_checkpoint(path, device):
     check_backbone(model_name)
     img_size = ck.get('img_size', ck_args.get('img_size', 224))
     local_head = bool(ck.get('local_head', ck_args.get('local_head', False)))
+    local_attn = bool(ck.get('local_attn', ck_args.get('local_attn', False)))
 
     clip_model = open_clip.create_model(model_name, pretrained=ck.get('pretrained', 'openai'))
     if img_size != 224:
         resize_positional_embedding(clip_model.visual, img_size)
     model = Net(clip_model, len(ck['classes']), rank, target, local_head=local_head,
-                lora_qkv=lora_qkv, lora_alpha=lora_alpha)
+                lora_qkv=lora_qkv, lora_alpha=lora_alpha, local_attn=local_attn)
     missing, unexpected = model.load_state_dict(ck.get('model', ck), strict=False)
     # `missing` is expected (the frozen backbone is absent by design); `unexpected`
     # is not -- it means the checkpoint holds trained tensors this rebuild cannot

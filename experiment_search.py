@@ -35,6 +35,11 @@ ARMS = {
     'semantic005': ['--semantic-weight', '0.05', '--semantic-conf', '0.5'],
     'semantic001': ['--semantic-weight', '0.01', '--semantic-conf', '0.5'],
     'semantic003': ['--semantic-weight', '0.03', '--semantic-conf', '0.5'],
+    # New attention/loss candidates.  The base recipe already enables
+    # --local-head, so these are clean single-variable arms.
+    'local_attn': ['--local-attn'],
+    'gce_apl': ['--loss-schedule', 'gce_apl'],
+    'local_attn_gce_apl': ['--local-attn', '--loss-schedule', 'gce_apl'],
 }
 
 
