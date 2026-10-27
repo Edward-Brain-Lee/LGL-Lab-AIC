@@ -1,0 +1,5 @@
+# Shell scripts must arrive on Linux with LF, or bash fails with `^M: command not found`.
+* text=auto eol=lf
+*.sh   text eol=lf
+*.py   text eol=lf
+*.md   text eol=lf

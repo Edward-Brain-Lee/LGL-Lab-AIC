@@ -13,3 +13,14 @@ smoke*/
 
 # Analysis dumps
 analysis*/
+# Submission artifacts -- regenerated from a checkpoint by infer.py; never source.
+pred_results*.csv
+pred_results*.zip
+sub_*.zip
+sub_*/
+
+# Local scratch (sample sheets, probe outputs)
+.tmp_probe/
+*.docx
+software.code-workspace
+1010.txt
