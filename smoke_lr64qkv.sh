@@ -9,10 +9,10 @@
 # the P0 of HANDOFF §39.5.  Both axes now have measurements and they disagree:
 #
 #   placement (rank 32 -> +--lora-qkv)  val_acc +0.42 -> 73.9077  (2.19x, board)
-#   capacity  (rank 32 -> rank 64)      val_acc +0.68 -> 73.47    (0.48x, proxy)
+#   capacity  (rank 32 -> rank 64)      val_acc +0.68 -> no board score
 #
-# Twice the hold-out gain, half the conversion: teammate §42's rank-64 arm reads
-# below the incumbent on score.py.  Nothing here should be read off val_acc.
+# Twice the hold-out gain, no board evidence: teammate §42's rank-64 arm was
+# never submitted.  Nothing here should be read off val_acc.
 # 0.675 is the rank 16 -> 32 rate on the out_proj path; it is NOT a rank 32 -> 64
 # rate.  This run is where the two axes are either compounded or shown to collide.
 #

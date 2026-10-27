@@ -33,10 +33,10 @@
 #
 # EXPECTATION, stated before the fact so the result cannot be retro-fitted:
 # the temperature paper's own dissenting evidence (UT Austin, NormSoftmax) found
-# learnable temperatures gains 不明显, and §41.4 says the proxy resolves only
-# +-0.07 with a 0.03 floor.  Both arms are therefore expected to land in the
-# +-0.1 band.  A null result here is a real result -- it closes a placement --
-# and neither arm is allowed to blend with the other (that would be fusion).
+# learnable temperatures gains 不明显, and the same-configuration noise floor is
+# 0.03 (§41.2).  Both arms are therefore expected to land in the +-0.1 band.  A
+# null result here is a real result -- it closes a placement -- and neither arm
+# is allowed to blend with the other (that would be fusion).
 #
 # Budget: 2 x ~3.4h train + 4 inference passes.  The board keeps the maximum over
 # all submissions, so a loss costs a slot and no points.
@@ -273,11 +273,11 @@ echo "=== [attntemp+junk] ALL DONE $(date) ==="
 echo "produced (4 submission candidates, 2 arms x 2 view sets):"
 echo "  sub_lr64qkv_attntemp_8v.zip / sub_lr64qkv_attntemp_scales.zip"
 echo "  sub_lr64qkv_junk_8v.zip / sub_lr64qkv_junk_scales.zip"
-echo "next: pull the csvs to the local box and score ALL of them, plus the"
-echo "      incumbent, on the SAME ruler -- never a proxy number beside a board number:"
-echo "        py -3 score.py sub_lr64qkv_attntemp_scales\\pred_results.csv"
-echo "        py -3 score.py sub_lr64qkv_junk_scales\\pred_results.csv"
-echo "        py -3 score.py <the 74.249 scales CSV>          <- incumbent"
-echo "      The proxy resolves only +-0.07 (§41.4) and the floor is 0.03 (§41.2):"
-echo "      a gap under ~0.07 does not justify a slot.  Never average two view"
-echo "      sets, two arms, or two checkpoints into a third answer -- that is fusion."
+echo "next: score the arms on the OFFICIAL training hold-out -- never on the test"
+echo "      set.  class_search.py compares per-image predictions on that same split,"
+echo "      so every CSV it takes is a hold-out prediction file (name,label):"
+echo "        py -3 class_search.py --reference <hold-out labels> \\"
+echo "            --baseline <incumbent hold-out csv> --candidates <each new csv>"
+echo "      The reference labels are noisy, so a gap under the 0.03 noise floor"
+echo "      (§41.2) does not justify a slot.  Never average two view sets, two"
+echo "      arms, or two checkpoints into a third answer -- that is fusion."

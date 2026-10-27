@@ -1,4 +1,4 @@
-"""Regression checks for row alignment, paired changes and proxy uncertainty."""
+"""Regression checks for row alignment, paired changes and excluded-class reporting."""
 import tempfile
 import unittest
 from pathlib import Path

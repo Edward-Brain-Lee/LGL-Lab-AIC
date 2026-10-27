@@ -1,7 +1,7 @@
 """Build visual semantic prototypes on disjoint official training images only.
 
 Uses a newly loaded OpenAI CLIP ViT-B/32 at its native 224px resolution. No test
-path, external images, guessed species names or leaderboard proxy are inputs.
+path, external images or guessed species names are inputs.
 """
 import argparse
 import hashlib

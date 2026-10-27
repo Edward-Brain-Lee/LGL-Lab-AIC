@@ -1,4 +1,4 @@
-"""Plan or run sequential, reproducible ablations; no reconstructed labels.
+"""Plan or run sequential, reproducible ablations on the official training split.
 
 With no --execute this prints commands and writes a plan. One arm changes one
 training knob. Runs always start from official OpenAI weights, never another

@@ -1,8 +1,10 @@
 """Search single-checkpoint recipes on the official training hold-out only.
 
-No test path or reconstructed labels are accepted. Each candidate contains one
+No test path is accepted. Each candidate contains one
 checkpoint, one fixed view set and a global train-frequency adjustment tau.
-The table ranks macro recall by default; V* remains diagnostic if supplied.
+The table ranks macro recall by default.  An optional frozen-CLIP agreement mask
+(``--vstar``) carved out of the same hold-out is scored alongside, but it is
+diagnostic only: it never enters the ranking or the selection metric.
 """
 import argparse
 import csv
@@ -255,7 +257,7 @@ def parse_args(argv=None):
     p.add_argument('--recipes', nargs='+', default=['plain', 'center', 'scales'])
     p.add_argument('--taus', nargs='+', type=float, default=[0, .1, .25, .5])
     p.add_argument('--metric', choices=['macro', 'accuracy', 'tail20_macro'], default='macro')
-    p.add_argument('--vstar', default='', help='optional frozen-CLIP V* file, same official training split')
+    p.add_argument('--vstar', default='', help='optional frozen-CLIP agreement mask (.npz) over the same official training split')
     p.add_argument('--batch-size', type=int, default=64)
     p.add_argument('--workers', type=int, default=4)
     p.add_argument('--out', default='analysis_checkpoint_search')

@@ -1,5 +1,9 @@
 # LGL-Lab-AIC 训练说明（AutoDL / 4090）
 
+> **2026-10-26 半决赛：先读 `SEMIFINAL_RUNBOOK.md`。** 本文下面 §3 的参数表是**复赛旧树**的
+> （`--tta-crops` / `--image-size` / `--noise-judge` / `perclass.py` 在当前代码里都不存在），
+> 照抄会报参数错误。半决赛的正确入口是 `bash run_sf.sh {plan|prep|smoke|train|infer|all}`。
+
 严格使用 **OpenAI CLIP ViT-B/32** 作为唯一骨干，**单模型、单推理流程**，不使用任何额外数据、不使用测试集训练、不做模型集成。
 
 ## 0. 文件
@@ -13,7 +17,8 @@
 | `analyze.py` | 训练后的错误分析报告（哪些类坏了、混淆是不是单向的）。`selftest.py` 会 import 它 |
 | `selftest.py` | **先跑这个**：10 秒自检，不需要数据 / GPU / CLIP 权重 |
 | `valmetrics.py` | 对**已有 checkpoint** 算 micro / macro 准确率并排对比，零训练成本。用来判断"排行榜分数比 `val_acc` 低"是不是度量口径造成的。**脚本会自检：`val_acc` 必须等于训练日志里的值** |
-| `probe.py` | **只读诊断，先跑这个**：一次冻结 CLIP 前向，测**标签噪声率 ρ**、构造干净代理集 `V*`、量测 train/test 域偏移、搜索 TTA/分辨率配方（`--tta`）、输出**噪声网格图**供人工确认噪声主线。`--calib` 是**离线排行榜代理**：给已有 checkpoint × 视图集在 `acc@V*` 上打分，**0 个提交名额**，且**必须先过校准门**（见 §4.5）。不训练、不提交 |
+| `checkpoint_search.py` | 在**官方训练留出集**上给已有 checkpoint × 视图集排序（`--recipes` / `--taus`），**0 个提交名额**，不训练、不提交、不读测试集 |
+| `class_search.py` | 逐类比较两份留出集预测（召回/精确率、Wilson 区间、混淆对、新胜/旧胜/净胜负），只写诊断 |
 | `perclass.py` | 对**已有 checkpoint** 打召回率分布直方图 + 每个坏类被误判成了什么。诊断"哪些类卡死了"。**注：至 2026-09-24 尚未创建**（此前的文档记载有误） |
 
 ## 1. 方法
@@ -73,9 +78,10 @@
 **Step 1 上传** FileZilla → 主机填实例的 `region.autodl.com`，**端口填 SSH 登录指令里 `-p` 后面的那个数字**（不是 22），协议 `SFTP`，用户 `root`，密码为实例密码。
 
 * 代码：`train.py` / `infer.py` / `losses.py` / `noise.py` / `analyze.py` / `valmetrics.py` /
-  `datastats.py` / `selftest.py` / `probe.py` / `requirements.txt` → `/root/autodl-tmp/`。
+  `datastats.py` / `selftest.py` / `checkpoint_search.py` / `class_search.py` / `requirements.txt`
+  → `/root/autodl-tmp/`。
   **必须放在同一层目录**——`train.py` import `losses`/`noise`，`selftest.py` import 其余全部，
-  `probe.py` import `train`（拿它的常量与数据集类，因此也会连带 import `losses`/`noise`）。
+  `checkpoint_search.py` import `train`（拿它的常量与数据集类，因此也会连带 import `losses`/`noise`）。
   别传 `__pycache__/`
 * 数据：几万张小文件用 FileZilla 传极慢，**先在本地打成 zip**，上传后 `unzip train.zip -d /root/autodl-tmp/`
   （Windows 下用 `tar -a -c -f train.zip train` 或右键压缩；AutoDL 上 `apt install unzip -y` 若缺）
@@ -189,7 +195,7 @@ zip submission.zip pred_results.csv
 | `--lora-rank` / `--lora-target` | 8 / all | `mlp` 只加在 MLP 上，更保守 |
 | `--val-ratio` | 0.1 | 验证集比例；定稿冲分时可降到 0.05 |
 | `--image-size` | 224 | 训练分辨率。**必须是 32 的倍数**（256/288/320/352/384），不要 336，见 §5 |
-| `--noise-judge` | 关 | 用**冻结 CLIP 的独立判断**否决“教师同意⇒标签干净”这条分支；被判为 suspect 的样本只降权、不会改标。默认关：先让 `probe.py` 量出它的误杀率再开 |
+| `--noise-judge` | 关 | 用**冻结 CLIP 的独立判断**否决“教师同意⇒标签干净”这条分支；被判为 suspect 的样本只降权、不会改标。默认关：**它的误杀率还没有在真机上量过**，量出来再开（见 §5） |
 | `--judge-margin` | 0.02 | 另一个类的质心要近多少（余弦）才判定"可疑"。0 = 平手也算；越大越保守 |
 | `--select` | val_acc | 选最佳权重依据，可换 `val_acc_hi` |
 | `--save-every` | 4 | 每 N 轮额外存一个 `epN.pt`（0 = 只留 best/last）。**这是拿真实排行榜选轮次的唯一手段**，见下文 |
@@ -258,16 +264,16 @@ zip submission.zip pred_results.csv
 5. LoRA 位置 → `--lora-target mlp`；
 6. **冻结 CLIP 独立判据** → `--noise-judge`（可配 `--judge-margin`）。
    这是本方案唯一不依赖类名的语义纠错手段，也是"自动、无需人工清洗"的落点。
-   **先跑 `probe.py` 看它的误杀率再开**：`probe.py` 报的 `s_other > s_self` 比例就是它的
-   触发率，而 `V*` 上的准确率就是它的精度；精度不够时调大 `--judge-margin`。
+   **先在官方训练留出集上量出它的误杀率再开**：日志里 `s_other > s_self` 的比例就是它的
+   触发率，冻结 CLIP 子集上的准确率就是它的精度；精度不够时调大 `--judge-margin`。
    注意它是**降权、不改标注**（`vetoed` 计数会出现在 `noise stats` 里）。
 7. **裁剪策略** → `infer.py --tta-crops center full pad`（**不需要重训**，纯粹是推理端）。
    默认的 `center` 并不是"整张图"：实测 3:4 的图只保留 **57.5%** 的画面，2:3 的只剩
    **51.0%**，而**正方形也只有 76.6%** —— 因为 `Resize(size*256/224)` + `CenterCrop(size)`
    本来就砍掉两个方向各 1/8。细粒度判据小、又常常不在正中，被裁掉的可能正是决定性的那块。
    三种策略都留在训练时的 patch 网格里，**不需要位置编码插值**，所以这条比第 8 项安全得多，
-   **建议先测这条**。哪些策略该进最终提交由 `probe.py --tta`（冻结 CLIP，快）粗筛，
-   再由 `probe.py --calib`（真 checkpoint，`acc@V*`，过了校准门才算数）定夺。
+   **建议先测这条**。哪些策略该进最终提交，先在**官方训练留出集**上用
+   `checkpoint_search.py` 的具名视图集粗筛，再由平台分数定夺（留出集只作预筛）。
    同一根轴上还有更细的一档 `--tta-ratios`（`wide`/`plain`/`mid`/`tight`），见 §4.5.4。
 
    > ⚠️ 但"不碰位置编码"**不等于**"没有风险"。三种策略的**表观物体尺寸**差别很大
@@ -302,81 +308,56 @@ zip submission.zip pred_results.csv
    同样地，`val_acc` 与平台的分差随表示变好单调收窄（6.54 → 4.45 → 3.34 → **2.62** 点）。
    再往上（352）会开始**上采样**（所需短边 402 > 测试集中位数 375），先验只有 ≲+0.3 点，
    而且 320 已经把源图自己的像素用掉 0.98 倍 —— **这条轴接近用完了**，不值得再花那 3 小时。
-   真正该用哪个尺寸由 `probe.py --tta` 实测决定
-   （它会在冻结 CLIP 上先做分辨率门控）。另见 §4.5：`--img-size` 是 `--image-size` 的别名
+   真正该用哪个尺寸由官方训练留出集实测决定
+   （冻结 CLIP 上先做分辨率门控，见 §4.5）。另见 §4.5：`--img-size` 是 `--image-size` 的别名
    （队友那边的拼法），checkpoint 里的分辨率两个键都认，**走别名会打日志**。
 
-## 4.5 离线排行榜代理（0 个提交名额）
+## 4.5 离线留出集标尺（0 个提交名额）
 
 **为什么有这一节**：全队**每天只有 2 个提交名额**，比 GPU 时间紧得多。在这之前，任何一个关于
 "该用哪套推理视图"的判断都要**烧掉一个名额**。这一节买的是一份本地信号。
 
 ### 4.5.1 怎么跑
 
+> **2026-10-11 合规清理**：本节原先给出的 `probe.py --calib ...` 命令所依赖的 `probe.py` 已**移出本
+> 仓库**（它依赖的训练接口早已删除，已无法运行）。**这一节的真正产出 —— 校准门和它量出来的结论 ——
+> 保留在下面 4.5.2。** 今天做同类事情用仓库里的 `checkpoint_search.py`：只读官方训练留出集，
+> 0 个提交名额，不训练、不提交、不读测试集。
+
 ```bash
-python selftest.py                     # 必须 ALL CHECKS PASSED
-# ⓪ 冒烟（一分钟上下）：只验"能不能加载、塔建得对不对"，数字全部无意义。
-#    --calib-views 不能少于 plain wide tta4：门就定义在这三个上，少给一个会被
-#    **在冻结 judge 跑完之后**直接拒绝（时间白花，什么都没得到）。
-#    **必须单独给 --out**：缓存文件名里只有视图，没有图片列表。现在读回时会比对
-#    图片列表、对不上就重算并打印 NOT reused，但分开 --out 是不必依赖那条保护的做法。
-#    --workers 默认 12，每个 worker 都带着一份模型：小内存实例会被 OOM 杀掉，
-#    冒烟给 4 就够。
-python probe.py --calib --checkpoint outputs/ep20.pt --limit 16 \
-  --calib-views plain wide tta4 --workers 4 --out ./probe_smoke
-# ① 先校准（必须有：没校准过的代理不是证据）。**必须传同一轮的两个 epoch**——
-#    门要比较 ep 之间是否相等，只给一个 checkpoint 门会直接判 FAIL 并停手
-python probe.py --calib --checkpoint outputs/ep4.pt outputs/ep20.pt
-# ② 过了门，再做全扫描（9 个单视图 + 36 个两两组合 + train.VIEW_SETS_SWEPT 的 10 个多视图集 = 55 个；
-#    其中在本次分辨率上退化的会被自动跳过并说明原因，例如 320 的 checkpoint 上 tta4s320 就不必跑
-#    ——它的 5 个视图里有两个是同一批像素。单独 s320 不跳过：它等于 plain，跑出来和 plain 同数）
-python probe.py --calib --calib-sweep --checkpoint outputs/ep4.pt outputs/ep20.pt
-# ③ 聚合方式的裁决：同一条扫描换一种聚合再跑一遍（缓存按 agg 分文件，重复跑是免费的）
-python probe.py --calib --calib-sweep --checkpoint outputs/ep4.pt outputs/ep20.pt \
-  --calib-agg feat --out ./probe_feat
+python selftest.py                                 # 必须 ALL CHECKS PASSED
+
+# 在官方训练留出集上给 checkpoint x 视图集排序。--recipes 是具名视图集，
+# --taus 是全局频次先验修正。同一条命令内 logits 共用；改 tau 重跑要加
+# --cache-dir 才免费（见 research_search_notes.md）。
+python checkpoint_search.py --data /root/autodl-tmp/train \
+  --checkpoints outputs_384pe_lr64qkv/ep16.pt outputs_384pe_lr64qkv/ep20.pt \
+  --recipes scales --taus 0 0.1 0.25 0.5 --out analysis_checkpoint_search
+
+# 可选：同一 split 上由冻结 CLIP 划出的子集，只作诊断、不参与排名
+python checkpoint_search.py --data /root/autodl-tmp/train \
+  --checkpoints outputs_384pe_lr64qkv/ep20.pt --vstar <mask.npz> --out analysis_vstar
 ```
 
-> 冒烟那步会打印 `self-check ... SKIPPED -- --limit ...`，**这是预期的**：`--limit` 只跑了前
-> 16 张图，它的 `val_acc` 必然对不上训练时记录的全量值，所以这一步显式跳过而不是让断言误报。
-> 只有那一步会这样；① ② ③ 都是全量，自检必须通过（打印 `val_acc reproduces training`）。
-> 另外，如果某个 `--out` 里留着上一次不同参数的缓存，会看到 `[cache] ... NOT reused`：
-> 那是正常的（说明它没被读错），不必重跑，也不影响后面任何数字。
+> 分辨率一律**从 checkpoint 里读**，不从命令行读——拿 288 的 checkpoint 按 224 跑**不会报错，只是
+> 分数更低**，这正是最需要防的静默错误。`checkpoint_search.py` 与 `infer.py` 都走 `train.ck_image_size`，
+> 兼容队友那棵树的 `args['img_size']` 键，走别名时会在日志里显式说明。
 
-> `--calib-agg` **两种都要跑**：`logit` 是 `infer.py` 的默认、也是拿到过分的那个；
-> `feat` 只是有理由的替代品，**从未上过排行榜**。两者缓存不共用
-> （缓存名 `calib_{stem}_{view}_{agg}_{hash8}`），所以第二次跑只花多出来的时间，不会重算第一遍。
+### 4.5.2 校准门：标尺必须先答对已经知道答案的题
 
-> **扫描比看上去贵，而且大部分成本在 CPU。** 视图集是作用在 val 子集（`--val-ratio 0.1`；
-> 初赛 val 是 10116 张，复赛按同比例更大）上的，每个视图集都要把每张图重新解一遍、缩一遍。
-> `probe.py --workers` **默认就是 12**
-> （`infer.py` 默认是 0，两者默认值不同，别记混），并行是默认开着的；真嫌慢就把它加上去，
-> 输出与 worker 数无关（变换确定性 + loader 按序产出）。
-> 带分辨率的名字（`s256`/`s288`/`s320`/`s352` 及其组合）还会**额外建一座 CLIP 塔**
-> （位置编码按该尺寸重插），选得越多建得越多 —— 先把单视图 + 多视图集扫完，
-> 分辨率组合按需再补，不必一次全开。
-
-`--calib` 读的输入是**队友那棵树产出的 checkpoint**（`args['img_size']` 键），
-我这边写的是 `args['image_size']`；兼容层两边都认，**走别名时会在日志里显式说明**
-（见 `train.ck_image_size`）。分辨率一律**从 checkpoint 里读**，不从 `--sizes` 读——
-拿 288 的 checkpoint 按 224 跑**不会报错，只是分数更低**，这正是最需要防的静默错误。
-
-### 4.5.2 校准门：代理必须先答对已经知道答案的题
-
-| # | 排行榜已实测 | 代理必须 |
+| # | 排行榜已实测 | 标尺必须 |
 | --- | --- | --- |
 | 1 | ep4 ≈ ep20（差 **0.0002**） | `acc@V*` 的差 **≤ 0.5 点** |
 | 2 | `wide` 单视图 < `plain`（**−2.16**） | 排序正确、幅度 ≥ 0.5 |
 | 3 | `tta4` > `plain`（**+2.09**） | 排序正确、幅度 ≥ 0.5 |
 | 负对照 | `val_acc` 在 #1 上是 **+5.02** | 必须**判不过** |
 
-**负对照是这一节的全部意义**：如果 `val_acc` 也能过门，那代理什么也没买到。
-判据在 `probe.calib_gate()`，是纯算术，`selftest.py` 会喂一张**故意做错**的表进去，
-确认它确实会判 FAIL——**一个恒返回 PASS 的门等于没有门**。
+**负对照是这一节的全部意义**：如果 `val_acc` 也能过门，那这个标尺什么也没买到。
+判据是纯算术（当时在 `probe.calib_gate()` 里，随该脚本一并移出本仓库）。踩过的一个真 bug 值得记下来：
+门里的度量是**分数**（0~1），而容差和排行榜数字是**百分点**。不换算的话 `abs(0.0002) <= 0.5` 会因为
+完全错误的理由成立，整张表全 PASS 而什么都没测。
 
-> 这个自检抓到过一个真 bug：门里的度量是**分数**（0~1），而容差和排行榜数字是**百分点**。
-> 不换算的话 `abs(0.0002) <= 0.5` 会因为完全错误的理由成立，整张表全 PASS 而什么都没测。
-
-**门没过就停手**，如实报告哪一条没过、为什么。**不要拿一个没校准的代理去做决策。**
+**门没过就停手**，如实报告哪一条没过、为什么。**不要拿一个没校准的标尺去做决策。**
 
 ### 4.5.3 度量的定义
 
@@ -424,7 +405,7 @@ python infer.py --test ... --checkpoint outputs_320/best.pt --tta-views tta4s288
 **核心假设**：队友已验证的收益来自**错误去相关**（4 视图平均比最好的单视图还高 2.09），
 而他们 8 个视图**全在缩放这一条轴上**（= 本工程的 `tta8`）。那 `sub_tta8` 花在 `mid`/`mid_flip`
 上的两次前向，换成 `full`/`pad` 买到的去相关性更多，**前向成本相同**（= `mix6` / `crops6`）。
-这条由 `probe.py --calib --calib-sweep` 离线裁决，不烧名额。
+这条由官方训练留出集离线裁决，不烧名额。
 
 ### 4.5.5 暂时不动的（等 TTA 视图轴的裁决落地再说）
 
@@ -450,7 +431,7 @@ python infer.py --test ... --checkpoint outputs_320/best.pt --tta-views tta4s288
   已落地：`infer.py --tta-views tta4`（或 `--tta-ratios plain wide tight --tta-flip` 那个 6 视图超集）
   —— 逐视角过**同一个头**再平均 logit（`--tta-agg logit`，默认）就是单条决策路径、就是单模型；
   `--tta-agg feat`（各视角特征先 L2 归一化、再求平均、再归一化一次，分类头只作用一次）同样只用**一个**
-  checkpoint 和一个头，也可以，但它**没有上过排行榜**，用之前先过 `probe.py --calib`）；
+  checkpoint 和一个头，也可以，但它**没有上过排行榜**，用之前先在官方训练留出集上比过）；
   `train.py --image-size N`
   训练高分辨率；`infer.py --tta-crops center full pad` 换裁剪策略（**连位置编码都不碰**，
   是最安全的一条 TTA）。**"训 3 个种子再平均"不可用。**
@@ -460,7 +441,7 @@ python infer.py --test ... --checkpoint outputs_320/best.pt --tta-views tta4s288
   > 336/32 = 10.5 不是整数，patch 卷积只能产出 10×10 的网格 —— 等价于 320 再加 16px
   > **永远没有 patch 看到的**死边。`train.build_clip` 会对这种尺寸打印警告，
   > `patch_grid()` 会算出真实网格（`selftest.py` 已锁死 224/288/320/352/384 干净、336 不干净）。
-  > 具体选哪个由 `probe.py --tta` 在**本数据集上实测**决定，不要照搬文献里的 336。
+  > 具体选哪个由**在本数据集上实测**决定（官方训练留出集粗筛 + 平台分数定夺），不要照搬文献里的 336。
 * 训练过程可复现：`selftest.py` 自检 + 固定种子 + checkpoint 内保存完整 `args`；噪声筛选（`noise.py`）是自动算法，不是人工清洗。
   `--image-size` 会随 `args` 进 checkpoint，`infer.py` / `valmetrics.py` / `analyze.py` 自动读回，
   所以"训练 320、推理 224"这种错配不会静默发生。

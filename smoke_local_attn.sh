@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# The image ships OMP_NUM_THREADS set to something libgomp rejects ("Invalid
+# value for environment variable OMP_NUM_THREADS", once per interpreter start).
+# Harmless for the gates, but it also means every CPU-side pool silently runs on
+# libgomp's default instead of ours.  run_lr64qkv.sh / run_attntemp_junk.sh /
+# run_qkv.sh all carry this line; the two local-attn scripts dropped it.
+unset OMP_NUM_THREADS || true
 ARM=local_attn_junk
 PY="${PY:-python}"
 DATA="${DATA:-/root/autodl-tmp/train}"
@@ -81,8 +87,13 @@ y[:4] = 1
 # which is what the per-class quota has to hold down.
 z6 = torch.cat([truth[0] + .01*torch.randn(per//2, d),
                 truth[1] + .01*torch.randn(per//2, d)])
-z = torch.cat([z, z6])
-y = torch.cat([y, torch.full((per,), 6)])
+# Replace class 6's folder in place -- do NOT append to it, which is what a
+# previous version of this line did.  Appending makes class 6 hold forty
+# members, and the quota is a function of the class count: ceil(40*5%) = 2, so
+# the appended version silently tests a different number from the one the
+# comment below is about.  selftest.py's check_junk_filter clones and overwrites
+# (z_e[60:70] = ...) for the same reason.
+z[(nclass-1)*per:] = z6
 means, present, _ = robust_centroids(z, y.tolist(), nclass, rounds=2, verbose=False)
 w, rep = junk_weights(z, y, means, present, mode='margin', max_frac=$MAX_FRAC, floor=$FLOOR, dedup_tau=.999, verbose=False)
 counts = torch.bincount(y, minlength=nclass)
@@ -101,7 +112,7 @@ assert torch.all(mass >= counts.float()*$FLOOR - 1e-5), (mass, counts)
 assert int((w[y==1] < 1).sum()) < int(counts[1])
 print('junk quota ok:', {k: rep[k] for k in ('judged','margin_pos','flagged','per_class_max','classes_over_20pct')})
 PYEOF
-echo '--- short real train + infer reconstruction ---'
+echo '--- short real train + infer end-to-end ---'
 test -d "$DATA" || { echo "FATAL: DATA=$DATA not found" >&2; exit 1; }
 test -d "$TEST" || { echo "FATAL: TEST=$TEST not found" >&2; exit 1; }
 "$PY" -u train.py --data "$DATA" --out "$OUT" --epochs 1 --limit-batches 2 --batch-size 32 --workers 2 --save-every 1 --img-size 384 --train-pos-embed --local-head --local-attn --lora-rank "$RANK" --lora-qkv --robust-loss apl --junk-filter margin --junk-floor "$FLOOR" --junk-max-frac "$MAX_FRAC" 2>&1 | tee "$OUT.log"

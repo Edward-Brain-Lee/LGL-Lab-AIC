@@ -281,7 +281,7 @@ def class_margins(class_counts, margin, power=0.0, device=None):
 
     ``power=0`` gives the same margin to each class. Positive powers increase
     the tail margin up to ``margin`` without multiplying it on tiny classes.
-    No validation or reconstructed-test statistics enter this calculation.
+    No validation-set statistics enter this calculation.
     """
     counts = torch.as_tensor(class_counts, dtype=torch.float32, device=device)
     return float(margin) * (counts.clamp_min(1).min() / counts.clamp_min(1)).pow(float(power))
@@ -1049,7 +1049,8 @@ def robust_centroids(feat, targets, nclass, rounds=2, chunk=8192, verbose=True):
     whatever the folder is confused with).  Every later round keeps only the samples
     whose *given* label is already the nearest centroid -- a sample the frozen tower
     can confirm without ever having been trained on it -- and re-averages on that
-    subset.  That kept set is the same construction ``probe.py`` calls ``V*``.
+    subset.  That kept set is the same construction the frozen-CLIP check uses
+    everywhere else in this file: trust only what the frozen tower agrees with.
 
     The class is never allowed to disappear: a class whose samples all disagree is
     telling us its whole folder is systematically wrong, and the honest answer is to

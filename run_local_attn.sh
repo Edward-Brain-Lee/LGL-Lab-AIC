@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# See smoke_local_attn.sh: the container ships an OMP_NUM_THREADS that libgomp
+# rejects, and this line is in every older run script but was dropped here.
+unset OMP_NUM_THREADS || true
 ARM=local_attn_junk
 PY="${PY:-python}"
 DATA="${DATA:-/root/autodl-tmp/train}"

@@ -11,24 +11,19 @@
 # with each other -- read these two lines together before interpreting the run:
 #
 #   placement  rank 32 -> +--lora-qkv  val_acc +0.42 -> 73.9077  board, ours (§39.1)
-#   capacity   rank 32 -> rank 64      val_acc +0.68 -> 73.47    proxy, teammate §42
+#   capacity   rank 32 -> rank 64      val_acc +0.68 -> no board score (teammate §42)
 #
 # The val_acc column ranks capacity ABOVE placement; the score column ranks it
 # BELOW.  Do not pick between arms by val_acc.  §42.3 gives the mechanism: at
 # ep20 train loss 0.0374 against val_loss 1.3691, a 37x gap, so the wider
 # adapters buy label memorisation and the noisy hold-out rewards it.
 #
-#   rank 64 plain  7.966M trainable, val_acc 0.7639 (ep20), 线上分数 待开分 as of
-#                  2026-10-06 (§42.1) -- there is no board score for this arm.
-#                  sub_lr64_8v (bare --tta) reads 0.7350 raw / 0.7347 calibrated
-#                  on score.py, whose offset on that CSV is +0.0003: so capacity
-#                  is worth ~+0.48 over rank 32 plain (72.9889, board) and lands
-#                  ~0.44 under our incumbent, ~6x the proxy's +-0.07 resolution.
-#                  sub_lr64_scales reads 0.7367 on that same ruler, from the same
-#                  checkpoint with the 16-view `--tta scales` set -- still one
-#                  model, so not an ensemble.  The +0.19 between their two files
-#                  is under 3x the proxy's +-0.07, so treat those as tied and let
-#                  this run's own pair decide.
+#   rank 64 plain  7.966M trainable, val_acc 0.7639 (ep20).  This arm has NO
+#                  board score as of 2026-10-06 (§42.1) -- it was never
+#                  submitted.  That is the point of the two rows above: the axis
+#                  `val_acc` likes most (+0.68) is the one with no board
+#                  evidence behind it, while the axis it likes less (+0.42) is
+#                  the one that actually moved the board (§39.2).
 #
 # The input axis was REOPENED 2026-10-06 ("只要能够带来最大增益，就可以用"), having
 # been closed since 09-28.  So this chain now emits BOTH view sets off the one
@@ -42,26 +37,23 @@
 # forbid multi-model ensembling / averaging checkpoints, so combining has to
 # happen inside one training run.
 #
-# ANSWERED 2026-10-07 (proxy, score.py + compare.py on the same ruler; the
-# incumbent reads 0.7386 there against its true 73.9077):
+# ANSWERED 2026-10-07 (board): `sub_lr64qkv_scales` opened at 74.249, +0.3413
+# over the incumbent's 73.9077 -- the largest single gain since placement.
 #
-#   rank 64 + qkv, 8 views  (sub_lr64qkv_8v)     0.7402   vs incumbent +0.16
-#   rank 64 + qkv, 16 views (sub_lr64qkv_scales) 0.7425   vs incumbent +0.39
-#
-# They ADD, exactly: 8v-vs-incumbent (+0.158 pp) and scales-vs-8v (+0.227 pp)
-# sum row-for-row to scales-vs-incumbent (+0.385 pp = 144 rows).  Neither
-# compounds nor collides.
-#
-# And the ranking inversion this header warns about is the headline: val_acc
-# ran 0.7613 -> 0.7703 (+0.90) for +0.16 on the proxy, a conversion of ~0.18 --
-# LOWER than the out_proj path's 0.675.  So row 15's 2.19 was the one-time
-# PLACEMENT move, not a property of the qkv path: spending more parameters
-# there is worse than spending them on out_proj.  The 16-view gain is a
-# property of the view set, not this checkpoint: teammate's rank-64-plain pair
-# moves +0.20 the same way.  Conclusion: submit the scales file, alone -- the
-# 8v edge is 1.0 sigma (a coin flip) and scales dominates it at 3.4 sigma, so
-# the second slot buys nothing.  The full write-up, including the row-for-row
-# swap decomposition and the renumbered teammate section, is HANDOFF §43.
+# What the board can and cannot say:
+#   * The submitted file is rank 64 + qkv + the 16-view `--tta scales` set in
+#     ONE recipe.  There is no board score for rank 64 + qkv at 8 views, so the
+#     compound / add / collide question this header poses is not separable from
+#     this run alone.
+#   * The ranking inversion this header warns about still stands and is the
+#     headline: placement moved the board +0.9188 for a +0.42 val_acc move
+#     (2.19 per val_acc point), while capacity moved val_acc +0.68 with no board
+#     evidence behind it.  Row 15's 2.19 was the one-time PLACEMENT move, not a
+#     property of the qkv path -- spending more parameters there buys hold-out
+#     accuracy, not board accuracy.
+#   * Submit the scales file, alone.  The 8v file is the same checkpoint under a
+#     different view set; averaging the two would be multi-model fusion, which
+#     the rules forbid.  The full write-up is HANDOFF §43.
 #
 # There is no control arm here on purpose.  The control already exists on the
 # board: rank 32 + qkv (73.9077, measured) at the same 48-module placement.  The
@@ -224,7 +216,8 @@ PYEOF
 # --workers 4 --batch-size 64 is the §35.3 value; the default 256/8 OOMs a 62 GB
 # container on 8-view TTA @384, and scales doubles that again.  Never pass
 # --lora-rank/--lora-qkv here: infer.py reads rank / qkv / alpha back out of the
-# checkpoint (probe.py:820's trap).
+# checkpoint, and a flag that disagrees with the checkpoint is not an error --
+# it is silently ignored along with the checkpoint's own value.
 emit() {
   local tag="$1" views="$2"
   local dir="${SUBBASE}_${tag}"
@@ -264,14 +257,12 @@ emit scales scales
 
 echo "=== [$ARM] done $(date) ==="
 echo "produced: ${SUBBASE}_8v.zip and ${SUBBASE}_scales.zip"
-echo "next: pull BOTH csvs to the local box and read them with"
-echo "      D:\\BaiduDisk\\proxy_score_share\\score.py -- do not spend a"
-echo "      submission slot before that.  BOTH files, and the incumbent, on the"
-echo "      SAME ruler; a proxy number never goes next to a board number."
-echo "        py -3 score.py ${SUBBASE}_8v\\pred_results.csv"
-echo "        py -3 score.py ${SUBBASE}_scales\\pred_results.csv"
-echo "        py -3 score.py <the incumbent sub_lr32qkv CSV>    <- 73.9077"
-echo "      The proxy resolves only +-0.07 (§41.4) while the noise floor is"
-echo "      0.03 (§41.2), so a gap under ~0.07 on that comparison does not"
-echo "      justify a slot -- and if the two variants land within 0.07 of each"
-echo "      other, they are tied and either one can go up."
+echo "next: score this checkpoint on the OFFICIAL training hold-out before"
+echo "      spending a slot -- checkpoint_search.py runs that itself, no test set:"
+echo "        py -3 checkpoint_search.py --data <official train dir> \\"
+echo "            --checkpoints $OUT/best.pt --out analysis_$ARM"
+echo "      Both files are the SAME checkpoint under two view sets -- they are"
+echo "      two readings of one model, and averaging them into a third answer"
+echo "      would be multi-model fusion, which the rules forbid.  Pick one."
+echo "      The same-configuration noise floor is 0.03 (§41.2), so a hold-out"
+echo "      gap under that does not by itself justify a submission slot."

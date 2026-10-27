@@ -116,7 +116,8 @@ PYEOF
 # ---- stage 3: inference --------------------------------------------------------
 # --workers 4 --batch-size 64 is the §35.3 value; the default 256/8 OOMs a 62 GB
 # container on 8-view TTA @384.  Never pass --lora-rank/--lora-qkv here: infer.py
-# reads rank / qkv / alpha back out of the checkpoint (probe.py:820's trap).
+# reads rank / qkv / alpha back out of the checkpoint, and a flag that disagrees
+# with the checkpoint is not an error -- it is silently ignored.
 echo "--- infer -> $SUB/pred_results.csv ---"
 "$PY" -u infer.py --test "$TEST" \
   --checkpoint "$OUT/best.pt" \
@@ -137,6 +138,7 @@ echo "size=$sz rows=$rows unique_names=$uniq malformed=$badfmt"
 
 (cd "$SUB" && zip -q "../${SUB}_tta8.zip" pred_results.csv)
 echo "=== [$ARM] done: ${SUB}_tta8.zip $(stat -c %s "${SUB}_tta8.zip") bytes ==="
-echo "next: pull $SUB/pred_results.csv to the local box and read it with"
-echo "      D:\\BaiduDisk\\proxy_score_share\\score.py  -- do not spend a"
-echo "      submission slot before that (rank-32 anchor reads 0.7298)."
+echo "next: before spending a slot, compare this arm against the ctrl per-class"
+echo "      on the OFFICIAL training hold-out -- class_search.py takes hold-out"
+echo "      prediction CSVs (name,label), not test-set submissions.  Board anchors"
+echo "      for the matched pair: ctrl (rank 32, out_proj) 72.9889, qkv 73.9077."

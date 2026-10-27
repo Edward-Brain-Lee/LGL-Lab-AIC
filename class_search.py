@@ -1,7 +1,7 @@
 """Read-only per-class comparison of candidate CSVs. Standard library only.
 
-The reference can be training hold-out labels or a reconstructed proxy. This
-tool never exports training weights, per-image patches, or a fused prediction.
+The reference is always the official training hold-out's labels. This tool never
+exports training weights, per-image patches, or a fused prediction.
 """
 import argparse
 import csv
@@ -75,7 +75,7 @@ def measure(pred, ref, base, excluded=frozenset(), counts=None):
                          precision=hits[label] / max(predicted[label], 1), predicted=predicted[label],
                          baseline_recall=oldhits[label] / n, gain=gains[label], loss=losses[label],
                          net=gains[label] - losses[label], wilson_low=lo, wilson_high=hi,
-                         uncertain_proxy=label in excluded,
+                         reference_uncertain=label in excluded,
                          train_count=(counts or {}).get(label, '')))
     total, current, previous = len(ref), sum(hits.values()), sum(oldhits.values())
     assert current - previous == newwin - oldwin
@@ -108,10 +108,10 @@ def write_csv(path, rows, fields):
 
 def main(a):
     ref, base = load_predictions(a.reference), load_predictions(a.baseline)
-    excluded = set()
-    if a.uncertain_blocks:
-        with open(a.uncertain_blocks, encoding='utf-8-sig', newline='') as f:
-            excluded = {r['assigned'] for r in csv.DictReader(f)}
+    # Classes the reference itself is unsure about.  Nothing populates this now;
+    # it stays as a parameter so a caller holding a documented exclusion list
+    # (e.g. a fold whose official labels were pooled) can pass one explicitly.
+    excluded = frozenset()
     counts = None
     if a.train_counts:
         counts = json.loads(Path(a.train_counts).read_text(encoding='utf-8'))
@@ -128,7 +128,7 @@ def main(a):
         confusions = [dict(given=c, predicted=p, n=n) for (c, p), n in pairs.most_common()]
         write_csv(out / f'{tag}_confusions.csv', confusions, ['given', 'predicted', 'n'])
         ranking.append(dict(candidate=str(Path(path).resolve()), **stats))
-        reliable = [r for r in rows if not r['uncertain_proxy']]
+        reliable = [r for r in rows if not r['reference_uncertain']]
         worst = sorted(reliable, key=lambda r: (r['recall'], r['label']))[:10]
         best = sorted(reliable, key=lambda r: (-r['recall'], r['label']))[:10]
         summaries.append(f"{path}: {100*stats['accuracy']:.4f}% delta {stats['delta_pp']:+.4f} pp; "
@@ -139,15 +139,13 @@ def main(a):
     write_csv(out / 'ranking.csv', ranking, list(ranking[0]))
     manifest = dict(reference=str(Path(a.reference).resolve()),
                     reference_sha256=hashlib.sha256(Path(a.reference).read_bytes()).hexdigest(),
-                    reference_kind=a.reference_kind, baseline=str(Path(a.baseline).resolve()),
+                    baseline=str(Path(a.baseline).resolve()),
                     excluded_classes=sorted(excluded), ranking=ranking,
                     candidate_sha256={str(Path(p).resolve()): hashlib.sha256(Path(p).read_bytes()).hexdigest()
                                       for p in a.candidates})
     (out / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
-    note = ('Reconstructed-test agreement is diagnostic, not measured label accuracy. '
-            'Do not fit class weights, offsets or per-image choices to this reference.'
-            if a.reference_kind == 'reconstructed-test' else
-            'Hold-out score measures noisy official training labels. Confirm generalisation independently.')
+    note = ('Hold-out score measures noisy official training labels. '
+            'Confirm generalisation independently.')
     (out / 'report.txt').write_text(note + '\n\n' + '\n\n'.join(summaries) + '\n', encoding='utf-8')
     print(note)
     print('\n\n'.join(summaries))
@@ -157,10 +155,8 @@ def main(a):
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--reference', required=True)
-    p.add_argument('--reference-kind', required=True, choices=['training-holdout', 'reconstructed-test'])
     p.add_argument('--baseline', required=True)
     p.add_argument('--candidates', nargs='+', required=True)
-    p.add_argument('--uncertain-blocks', default='')
     p.add_argument('--train-counts', default='', help='optional JSON from official training-folder counts')
     p.add_argument('--out', default='analysis_class_search')
     return p.parse_args(argv)
