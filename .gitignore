@@ -18,6 +18,7 @@ pred_results*.csv
 pred_results*.zip
 sub_*.zip
 sub_*/
+submission_*/
 
 # Local scratch (sample sheets, probe outputs)
 .tmp_probe/
