@@ -235,6 +235,10 @@ def main(a):
     # predictions instead of a loud failure.
     local_head = bool(ck.get('local_head', ck_args.get('local_head', False)))
     local_attn = bool(ck.get('local_attn', ck_args.get('local_attn', False)))
+    # --local-se adds se_reduce/se_expand/se_scale to the local head.  Rebuild it or
+    # load_state_dict(strict=False) reports those tensors as *unexpected* and the
+    # assert below fires after a full training run has already been paid for.
+    local_se = bool(ck.get('local_se', ck_args.get('local_se', False)))
 
     clip_model = open_clip.create_model(model_name, pretrained=pretrained)
     if img_size != 224:
@@ -242,7 +246,7 @@ def main(a):
         print(f'img_size={img_size}: positional grid resampled to {grid}x{grid}')
     model = Net(clip_model, len(classes), rank, target, local_head=local_head,
                 lora_qkv=lora_qkv, lora_alpha=lora_alpha, attn_temp=attn_temp,
-                local_attn=local_attn)
+                local_attn=local_attn, local_se=local_se)
     missing, unexpected = model.load_state_dict(ck.get('model', ck), strict=False)
     assert not unexpected, ('checkpoint carries trained weights this model cannot hold: '
                             f'{sorted(unexpected)[:5]}')
@@ -254,7 +258,8 @@ def main(a):
     print(f'loaded {a.checkpoint} (epoch {ck.get("epoch", "?")}, '
           f'{len(classes)} classes, {model_name}, lora rank {rank}/{target}'
           f'{", qkv" if lora_qkv else ""}{", train-ln" if train_ln else ""}'
-          f'{", attn-temp" if attn_temp else ""}{", local-attn" if local_attn else ""})')
+          f'{", attn-temp" if attn_temp else ""}{", local-attn" if local_attn else ""}'
+          f'{", local-se" if local_se else ""})')
     if attn_temp:
         tau = model.attn_temperature()
         print(f'attention temperature: {tau.numel()} heads, '

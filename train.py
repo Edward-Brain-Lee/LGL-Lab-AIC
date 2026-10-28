@@ -624,9 +624,10 @@ class LocalPatchHead(nn.Module):
     """
 
     def __init__(self, width, out_dim, base_proj=None, attentive=False,
-                 attn_heads=1, attn_dim=64):
+                 attn_heads=1, attn_dim=64, se=False, se_ratio=16):
         super().__init__()
         self.attentive = bool(attentive)
+        self.se = bool(se)
         # SimPool uses a full-dimensional query/key dot product.  Keep one
         # compact head here: scalar-per-head projections are only a rank-H
         # bilinear score and collapse under the local residual gate.
@@ -687,9 +688,33 @@ class LocalPatchHead(nn.Module):
             self.query_proj = None
             self.key_proj = None
             self.sim_scale = None
+        # SE-style channel recalibration on the same token stream.  It acts on the
+        # channel axis (squeeze to one global vector, excite per channel), which the
+        # project's own review (§45.8) lists as the *least* promising axis for this
+        # failure mode -- so it is built as a single-variable control arm, not as an
+        # expected win.  The last layer is zero-initialised, so at step 0 the scale
+        # is exactly 1.0 (bit-identical to plain mean pooling), and the outer local
+        # residual gate is additionally zero, so the whole model is the incumbent.
+        if self.se:
+            hidden = max(1, int(width) // int(se_ratio))
+            self.se_reduce = nn.Linear(width, hidden)
+            self.se_expand = nn.Linear(hidden, width)
+            nn.init.zeros_(self.se_expand.weight)
+            nn.init.zeros_(self.se_expand.bias)
+            self.se_scale = nn.Parameter(torch.ones(()))
+        else:
+            self.se_reduce = None
+            self.se_expand = None
+            self.se_scale = None
 
     def forward(self, tokens):
         # tokens are final, layer-normalised spatial tokens: [B, N, width]
+        if self.se_expand is not None:
+            # squeeze over tokens, excite over channels; tanh keeps the residual in
+            # [-1, 1] so a single noisy batch cannot invert a whole channel
+            s = tokens.mean(dim=1)
+            e = self.se_expand(F.relu(self.se_reduce(s)))
+            tokens = tokens * (1.0 + torch.tanh(self.se_scale) * torch.tanh(e)).unsqueeze(1)
         if self.score is None:
             pooled = tokens.mean(dim=1)
         else:
@@ -765,7 +790,7 @@ class Net(nn.Module):
     def __init__(self, clip_model, nclass, lora_rank=8, lora_target='all',
                  proto_momentum=0.99, proto_temp=0.1, local_head=False,
                  lora_qkv=False, lora_alpha=0.0, attn_temp=False,
-                 local_attn=False):
+                 local_attn=False, local_se=False):
         super().__init__()
         self.clip = clip_model
         dim = clip_model.visual.output_dim
@@ -776,6 +801,7 @@ class Net(nn.Module):
         alpha = lora_alpha if lora_alpha > 0 else 2 * lora_rank
         self.lora_alpha, self.lora_qkv, self.attn_temp = alpha, lora_qkv, attn_temp
         self.local_attn = bool(local_attn)
+        self.local_se = bool(local_se)
         self.n_lora = add_lora(self.clip.visual, lora_rank, alpha,
                                target=lora_target, qkv=lora_qkv, attn_temp=attn_temp)
         self._anchor_names = {}
@@ -796,7 +822,7 @@ class Net(nn.Module):
                 raise SystemExit('local patch head requires a ViT visual transformer with a width')
             self.local_head = LocalPatchHead(int(width), int(dim),
                                              getattr(visual, 'proj', None),
-                                             attentive=local_attn)
+                                             attentive=local_attn, se=local_se)
 
     def forward(self, x, return_feat=False):
         if self.local_head is None:
@@ -1312,7 +1338,8 @@ def evaluate(model, loader, device, amp_dtype, use_amp, nclass=None, class_count
 SNAPSHOT_KEYS = ('model', 'classes', 'class_counts', 'args', 'epoch', 'val_acc',
                  'val_macro', 'val_tail', 'val_balanced',
                  'val_acc_hi', 'lora_rank', 'lora_target', 'lora_alpha', 'lora_qkv',
-                 'train_ln', 'pretrained', 'model_name', 'local_head', 'local_attn', 'attn_temp',
+                 'train_ln', 'pretrained', 'model_name', 'local_head', 'local_attn',
+                 'local_se', 'attn_temp',
                  'junk_w', 'junk_report')
 
 
@@ -1383,7 +1410,7 @@ def main(a):
         print(f'img_size={a.img_size}: positional grid resampled to {grid}x{grid}')
     model = Net(clip_model, nclass, a.lora_rank, a.lora_target,
                 a.proto_momentum, a.proto_temp, a.local_head,
-                a.lora_qkv, a.lora_alpha, a.attn_temp, a.local_attn).to(device)
+                a.lora_qkv, a.lora_alpha, a.attn_temp, a.local_attn, a.local_se).to(device)
     if a.train_pos_embed:
         # after Net() (which freezes the backbone) and before the optimiser / teacher
         n_pe = enable_pos_embed_training(model)
@@ -1396,7 +1423,7 @@ def main(a):
         print(f'--fixed-anchor: captured {len(model._anchor_names)} initial backbone tensors')
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f'model={a.model}/{a.pretrained} layers={model.n_lora} lora_alpha={model.lora_alpha:g} '
-          f'lora_qkv={model.lora_qkv} attn_temp={model.attn_temp} '
+          f'lora_qkv={model.lora_qkv} attn_temp={model.attn_temp} local_se={model.local_se} '
           f'trainable params={n_train/1e6:.3f}M')
 
     teacher = copy.deepcopy(model).to(device).eval()
@@ -1444,6 +1471,12 @@ def main(a):
             raise SystemExit(
                 f'--resume: checkpoint local-attn={ck_local_attn} but this run has '
                 f'--local-attn={bool(a.local_attn)}; the local token scorer would be '
+                'missing or silently ignored.  Re-run with the matching flag.')
+        ck_local_se = bool(ck.get('local_se', ck.get('args', {}).get('local_se', False)))
+        if ck_local_se != bool(a.local_se):
+            raise SystemExit(
+                f'--resume: checkpoint local-se={ck_local_se} but this run has '
+                f'--local-se={bool(a.local_se)}; the SE excitations would be '
                 'missing or silently ignored.  Re-run with the matching flag.')
         ck_schedule = ck.get('args', {}).get('loss_schedule', 'fixed')
         if ck_schedule != a.loss_schedule:
@@ -1759,7 +1792,7 @@ def main(a):
               'lora_alpha': a.lora_alpha, 'lora_qkv': bool(a.lora_qkv),
               'train_ln': bool(a.train_ln), 'attn_temp': bool(a.attn_temp),
               'model_name': a.model, 'local_head': bool(a.local_head),
-              'local_attn': bool(a.local_attn),
+              'local_attn': bool(a.local_attn), 'local_se': bool(a.local_se),
               'junk_w': junk_w, 'junk_report': junk_report,
               'optim': opt.state_dict(), 'sched': sched.state_dict(), 'tracker': tracker.state_dict(),
               'rng': {'torch': torch.get_rng_state(),
@@ -1892,6 +1925,14 @@ def parse_args(argv=None):
                         'zero at step 0, so the complete model starts at the historical '
                         'path and then learns to suppress background and junk patches. '
                         'Requires --local-head.')
+    p.add_argument('--local-se', action='store_true', dest='local_se',
+                   help='apply SE-style channel recalibration (squeeze over tokens, '
+                        'excite over channels, reduction 16) to the local patch tokens '
+                        'before pooling.  The last layer is zero-initialised and the '
+                        'outer local residual gate is zero, so step 0 is bit-identical '
+                        'to plain --local-head mean pooling.  This is the control arm '
+                        'the project review (HANDOFF 45.8) rates lowest: run it as a '
+                        'single variable, not as an expected win.  Requires --local-head.')
 
     p.add_argument('--crop-min', type=float, default=0.55)
     p.add_argument('--train-pos-embed', action='store_true', dest='train_pos_embed',
@@ -2013,6 +2054,8 @@ def parse_args(argv=None):
     a = p.parse_args(argv)
     if a.local_attn and not a.local_head:
         p.error('--local-attn requires --local-head')
+    if a.local_se and not a.local_head:
+        p.error('--local-se requires --local-head')
     if not 0 <= a.class_weight_beta <= 1:
         p.error('--class-weight-beta must lie in [0, 1]')
     if not 0 < a.class_weight_min <= 1 <= a.class_weight_max:

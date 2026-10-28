@@ -126,13 +126,29 @@ def gate_data(train, test, classes=SF_CLASSES, n_train=SF_TRAIN, n_test=SF_TEST,
                 rows=rows, bytes=nbytes, counts=counts, dirs=dirs)
 
 
+ATTN_DIM = 64          # --local-attn query/key width
+SE_RATIO = 16          # --local-se channel reduction
+ARM_KEYS = ('local_attn', 'local_se', 'attn_temp')
+
+
+def arm_of(recipe):
+    """The attention-arm switches a recipe/log/checkpoint says it used.
+
+    They are kept out of RECIPE on purpose: RECIPE *is* the 74.249 baseline, and
+    adding keys with False defaults would make the `params` CLI advertise
+    `--local-head False` style flags whose bool() parse turns "False" into True.
+    """
+    return {k: bool(recipe.get(k, False)) for k in ARM_KEYS}
+
+
 def expected_csv(names):
     """Rows and bytes that `infer.py` must produce for exactly these names."""
     return len(names), sum(len(n) for n in names) + len(names) * (1 + 4 + 2)
 
 
 def expected_trainable(nclass, width=768, dim=512, rank=64, qkv=True,
-                       local_head=True, pos_tokens=145):
+                       local_head=True, pos_tokens=145,
+                       local_attn=False, local_se=False, attn_temp=False):
     """Trainable-parameter budget of the 74.249 recipe, from module shapes.
 
     Adapters (LoRA on every `nn.Linear` of all 12 blocks):
@@ -150,20 +166,39 @@ def expected_trainable(nclass, width=768, dim=512, rank=64, qkv=True,
     head = nclass * dim + 1
     local = (width * dim + 1) if local_head else 0
     pos = (pos_tokens * width) if pos_tokens else 0
-    return dict(adapters=adapters, head=head, local=local, pos=pos,
-                total=adapters + head + local + pos)
+    # `--local-attn` (SimPool Q/K pooling): query_proj + key_proj (bias=False,
+    # ATTN_DIM wide), the legacy scalar `score` row (1 x width), sim_scale, log_temp.
+    token_attn = (2 * width * ATTN_DIM + width + 2) if (local_head and local_attn) else 0
+    # `--local-se` (SE channel recalibration): reduce + expand, both with bias,
+    # plus the scalar residual scale.
+    if local_head and local_se:
+        hid = max(1, width // SE_RATIO)
+        se = (width * hid + hid) + (hid * width + width) + 1
+    else:
+        se = 0
+    # `--attn-temp`: one rho per head per block (ViT-B/32 = 12 heads x 12 blocks).
+    temp = (12 * (width // 64)) if attn_temp else 0
+    return dict(adapters=adapters, head=head, local=local, token_attn=token_attn,
+                se=se, temp=temp, pos=pos,
+                total=adapters + head + local + token_attn + se + temp + pos)
 
 
 def gate_params(nclass, rank=64, qkv=True, img_size=384, local_head=True,
-                train_pos_embed=True, verbose=True):
+                train_pos_embed=True, local_attn=False, local_se=False,
+                attn_temp=False, verbose=True):
     tokens = (img_size // 32) ** 2 + 1
     e = expected_trainable(nclass, rank=rank, qkv=qkv, local_head=local_head,
-                           pos_tokens=tokens if train_pos_embed else 0)
+                           pos_tokens=tokens if train_pos_embed else 0,
+                           local_attn=local_attn, local_se=local_se,
+                           attn_temp=attn_temp)
     printed = f'{e["total"] / 1e6:.3f}M'
     if verbose:
         ok(f'expected trainable params = {e["total"]:,} ({printed})')
         ok(f'  adapters {e["adapters"]:,} + head {e["head"]:,} + '
            f'local {e["local"]:,} + pos {e["pos"]:,} ({tokens} tokens)')
+        if local_attn or local_se or attn_temp:
+            ok(f'  arm: token_attn {e["token_attn"]:,} + se {e["se"]:,} + '
+               f'temp {e["temp"]:,}')
     return e, printed
 
 
@@ -184,10 +219,11 @@ def gate_log(log_path, classes=SF_CLASSES, recipe=RECIPE, verbose=True):
     text = Path(log_path).read_text(encoding='utf-8', errors='replace')
     if 'Traceback' in text:
         fail(f'traceback in {log_path}')
-    nclass = recipe['rank'], recipe['qkv']
+    arm = arm_of(recipe or {})
     e = expected_trainable(classes, rank=recipe['rank'], qkv=recipe['qkv'],
                            local_head=recipe['local_head'],
-                           pos_tokens=(recipe['img_size'] // 32) ** 2 + 1)
+                           pos_tokens=(recipe['img_size'] // 32) ** 2 + 1,
+                           **arm)
     printed = f"{e['total'] / 1e6:.3f}M"
     # accept the neighbouring rounding too: f'{n/1e6:.3f}' flips at n/1e6 = .xxx5,
     # and the print is the only place the total appears.
@@ -209,6 +245,11 @@ def gate_log(log_path, classes=SF_CLASSES, recipe=RECIPE, verbose=True):
         (f'classes={classes}', kv('classes', classes)),
         ('positional grid trainable', re.search(r'positional grid is now trainable', text)),
     ]
+    # An arm that silently failed to reach train.py would train the baseline and
+    # look perfectly healthy in every other line of the log.
+    for k in ARM_KEYS:
+        if arm[k]:
+            checks.append((f'{k}=True', kv(k, 'True')))
     bad = [name for name, m in checks if not m]
     if bad:
         fail(f'{log_path} is missing: {bad}')
@@ -255,21 +296,49 @@ def gate_ckpt(path, classes=SF_CLASSES, recipe=RECIPE, verbose=True):
     # whole-checkpoint sum disagree with the printed parameter count by
     # nclass x 512 for no real reason.
     model = ck['model']
+    arm = arm_of(dict(args, **{k: ck.get(k, args.get(k)) for k in ARM_KEYS}))
     e = expected_trainable(classes, rank=recipe['rank'], qkv=recipe['qkv'],
-                           local_head=recipe['local_head'], pos_tokens=tokens)
+                           local_head=recipe['local_head'], pos_tokens=tokens,
+                           **arm)
     adapters = sum(v.numel() for k, v in model.items() if k.endswith(('.A', '.B')))
     if adapters != e['adapters']:
         fail(f'{path}: {adapters:,} adapter weights, expected {e["adapters"]:,}')
     parts = {'head.weight': (classes, 512), 'head.logit_scale': (),
              # nn.Linear(width, dim) -> weight is (out_features, in_features)
              'local_head.proj.weight': (512, 768), 'local_head.gate': ()}
+    # Arm tensors join the *same* shape check as the baseline ones.  Counting them
+    # only in the total would let a transposed projection through: state_dict
+    # matches by name and shape, so a (768, 48) expand where (48, 768) belongs would
+    # load *and* keep the parameter count right.
+    if arm['local_se']:
+        hid = max(1, 768 // SE_RATIO)
+        parts.update({'local_head.se_reduce.weight': (hid, 768),
+                      'local_head.se_reduce.bias': (hid,),
+                      'local_head.se_expand.weight': (768, hid),
+                      'local_head.se_expand.bias': (768,),
+                      'local_head.se_scale': ()})
+    if arm['local_attn']:
+        parts.update({'local_head.query_proj.weight': (ATTN_DIM, 768),
+                      'local_head.key_proj.weight': (ATTN_DIM, 768),
+                      'local_head.score.weight': (1, 768),
+                      'local_head.sim_scale': (1,),
+                      'local_head.log_temp': (1,)})
     for name, shape in parts.items():
         if name not in model:
             fail(f'{path}: missing {name} — the checkpoint was not trained with '
-                 f'the 74.249 recipe')
+                 f'the recipe this gate expects')
         if tuple(model[name].shape) != shape:
             fail(f'{path}: {name} {tuple(model[name].shape)}, expected {shape}')
-    n_trained = adapters + sum(model[n].numel() for n in parts) + pe[0].numel()
+    rho = [v for k, v in model.items() if k.endswith('attn_rho')]
+    if arm['attn_temp']:
+        if len(rho) != 12 or any(tuple(v.shape) != (768 // 64,) for v in rho):
+            fail(f'{path}: {len(rho)} attn_rho tensors of unexpected shape — '
+                 f'--attn-temp did not take')
+    elif rho:
+        fail(f'{path} carries attn_rho but this recipe has attn_temp=0')
+    n_rho = sum(v.numel() for v in rho)
+    n_trained = (adapters + sum(model[n].numel() for n in parts)
+                 + pe[0].numel() + n_rho)
     if n_trained != e['total']:
         fail(f'{path}: {n_trained:,} trained weights, expected {e["total"]:,}')
     if verbose:
@@ -349,6 +418,10 @@ def cli(argv=None):
     s.add_argument('--classes', type=int, default=SF_CLASSES)
     for k, v in RECIPE.items():
         s.add_argument('--' + k.replace('_', '-'), type=type(v), default=v)
+    # explicit store_true: `type=bool` would read "--local-se False" as True
+    s.add_argument('--local-attn', action='store_true', dest='local_attn')
+    s.add_argument('--local-se', action='store_true', dest='local_se')
+    s.add_argument('--attn-temp', action='store_true', dest='attn_temp')
 
     c = sub.add_parser('ckpt', help='checkpoint carries the right recipe')
     c.add_argument('--checkpoint', required=True)
@@ -368,7 +441,7 @@ def cli(argv=None):
         gate_data(a.train, a.test, a.classes, a.n_train, a.n_test)
     elif a.cmd == 'params':
         gate_params(a.classes, a.rank, a.qkv, a.img_size, a.local_head,
-                    a.train_pos_embed)
+                    a.train_pos_embed, a.local_attn, a.local_se, a.attn_temp)
     elif a.cmd == 'ckpt':
         gate_ckpt(a.checkpoint, a.classes)
     elif a.cmd == 'csv':

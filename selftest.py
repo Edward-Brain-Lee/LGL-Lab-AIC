@@ -765,6 +765,70 @@ def check_local_attention_and_schedule():
     print('  local token attention zero-init and phased loss schedule ok')
 
 
+def check_local_se():
+    """``--local-se``: channel recalibration that must be a no-op before step 1.
+
+    The whole point of putting SE here as a *control arm* is that it is a single
+    variable.  Two failures would destroy that and neither is visible from a log
+    line: an SE block that is already active at step 0 (so the arm starts from a
+    different model than the incumbent), or one whose gradient never reaches the
+    squeeze layer (so it trains a dead branch and reads as "SE doesn't help").
+    """
+    torch.manual_seed(0)
+    h, d, n = 8, 6, 5
+    base = train.LocalPatchHead(h, d)
+    se = train.LocalPatchHead(h, d, se=True)
+    se.proj.weight.data.copy_(base.proj.weight.data)
+    tokens = torch.randn(2, n, h)
+
+    # reduction 16 collapses a width-8 tower to one channel, which is the minimum
+    # the constructor may produce -- it must not divide by zero on a tiny tower
+    assert se.se_expand.weight.shape == (h, 1), se.se_expand.weight.shape
+    assert torch.equal(se.se_expand.weight, torch.zeros_like(se.se_expand.weight))
+    assert torch.equal(se.se_scale, torch.ones_like(se.se_scale))
+    assert se.se_reduce is not None and se.se_expand is not None
+
+    # step-0 invariant: the zero-initialised excite layer makes the residual term
+    # exactly 0.0, and tokens * 1.0 is exact in IEEE754, so the whole head is
+    # bit-identical to plain mean pooling
+    assert torch.equal(base(tokens), se(tokens)), 'SE is not a no-op at step 0'
+
+    out = se(tokens)
+    assert torch.isfinite(out).all()
+    out.sum().backward()
+    # At step 0 exactly one of the three tensors is live.  The excite layer is the
+    # last thing before the residual, so it gets a real gradient; the squeeze layer
+    # behind it is multiplied by the zero excite weights, and the scalar scale sits
+    # on `tanh(e)` which is exactly 0 at init.  Both must be *exactly* zero, not
+    # merely small -- an SE block whose scale moved on batch 1 would no longer be
+    # the step-0-identical control arm the experiment claims it is.
+    assert se.se_expand.weight.grad is not None and se.se_expand.weight.grad.abs().sum() > 0
+    for name, p in (('se_reduce', se.se_reduce.weight), ('se_scale', se.se_scale)):
+        g = p.grad
+        assert g is None or float(g.abs().sum()) == 0.0, \
+            f'{name} should be dead before step 1: its path is multiplied by tanh(0)'
+
+    # after one update the branch must actually change the output, and all three
+    # tensors must then be live -- otherwise the arm trains a frozen recalibration
+    with torch.no_grad():
+        se.se_expand.weight.normal_(0, 0.1)
+        se.se_expand.bias.normal_(0, 0.1)
+    se.zero_grad(set_to_none=True)
+    out2 = se(tokens)
+    assert not torch.equal(base(tokens), out2), 'SE never changed the output'
+    out2.sum().backward()
+    for name, p in (('se_reduce', se.se_reduce.weight), ('se_scale', se.se_scale),
+                    ('se_expand', se.se_expand.weight)):
+        g = p.grad
+        assert g is not None and float(g.abs().sum()) > 0, f'{name} still gets no gradient'
+
+    # the production budget sf_gate.py must reproduce: width 768, reduction 16
+    prod = train.LocalPatchHead(768, 512, se=True)
+    n_se = sum(p.numel() for k, p in prod.named_parameters() if k.startswith('se_'))
+    assert n_se == 74_545, f'local-se budget is {n_se}, sf_gate expects 74,545'
+    print('  local SE recalibration is a step-0 no-op, live afterwards, 74,545 params ok')
+
+
 def check_junk_filter():
     """``--junk-filter``: frozen-tower screening of 杂图 and near-duplicates.
 
@@ -1298,6 +1362,7 @@ if __name__ == '__main__':
     check_lora_qkv_and_ln()
     check_attn_temp()
     check_local_attention_and_schedule()
+    check_local_se()
     check_junk_filter()
     check_pos_embed_resize()
     check_train_pos_embed()

@@ -29,6 +29,7 @@ Compliance (README 十一), unchanged by the stage switch
 import argparse
 import hashlib
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -148,7 +149,7 @@ def stage_prep(a):
             else:
                 sys.exit(f'{dirs[k]} does not hold {k} data; pass --{k}')
     g = sf_gate.gate_data(dirs['train'], dirs['test'])
-    sf_gate.gate_params(g['classes'])
+    sf_gate.gate_params(g['classes'], **plan_param_kwargs())
     log('PREP OK — layout, counts and the expected budget all match')
     return dirs
 
@@ -156,6 +157,42 @@ def stage_prep(a):
 # --------------------------------------------------------------------------- #
 # commands
 # --------------------------------------------------------------------------- #
+# Extra train.py switches for the arm being run (`--local-se`, `--local-attn`,
+# `--attn-temp`, `--junk-*`, ...).  Set once from --extra in main(); train_cmd
+# appends it to *every* invocation, so the 20-batch smoke inside the gate trains
+# the same arm the full run does instead of silently testing the baseline.
+TRAIN_EXTRA = []
+
+
+def arm_recipe():
+    """RECIPE plus whichever attention switches this run's --extra requests.
+
+    Without this the log gate would still validate the 10.198M baseline budget and
+    reject a correct --local-se run *after* it has spent two hours training.
+    """
+    r = dict(RECIPE)
+    for key in sf_gate.ARM_KEYS:      # every arm key must exist, defaulting off
+        r.setdefault(key, False)
+    for tok in TRAIN_EXTRA:
+        key = tok.lstrip('-').replace('-', '_')
+        if key in sf_gate.ARM_KEYS:
+            r[key] = True
+    return r
+
+
+def plan_param_kwargs():
+    """The RECIPE keys gate_params accepts, with this run's arm switches applied.
+
+    Without it `plan --extra '--local-se'` would preview the 10.198M baseline
+    budget next to a command that trains 10.272M — an off-by-one-recipe in the
+    one place an operator looks to confirm the arm is wired.
+    """
+    r = arm_recipe()
+    keys = ('rank', 'qkv', 'img_size', 'local_head', 'train_pos_embed',
+            'local_attn', 'local_se', 'attn_temp')
+    return {k: r[k] for k in keys}
+
+
 def train_cmd(data, out, epochs=None, limit_batches=0):
     cmd = [sys.executable, '-u', 'train.py', '--data', str(data), '--out', str(out),
            '--epochs', str(1 if limit_batches else (epochs or RECIPE['epochs'])),
@@ -166,6 +203,7 @@ def train_cmd(data, out, epochs=None, limit_batches=0):
            '--train-pos-embed', '--local-head',
            '--save-every', '1' if limit_batches else str(RECIPE['save_every']),
            '--lora-rank', str(RECIPE['rank']), '--lora-qkv']
+    cmd += list(TRAIN_EXTRA)
     if limit_batches:
         cmd += ['--limit-batches', str(limit_batches)]
     return cmd
@@ -276,10 +314,10 @@ def stage_smoke(a, data, test):
 
     log('--- gate 1: dataset + expected parameter budget ---')
     if a.dry_run:
-        sf_gate.gate_params(sf_gate.SF_CLASSES)
+        sf_gate.gate_params(sf_gate.SF_CLASSES, **plan_param_kwargs())
     else:
         sf_gate.gate_data(data, test)
-        sf_gate.gate_params(sf_gate.SF_CLASSES)
+        sf_gate.gate_params(sf_gate.SF_CLASSES, **plan_param_kwargs())
 
     log('--- gate 2: the real ViT-B/32 tower ---')
     rc = run([sys.executable, '-u', 'sf_tower_gate.py',
@@ -298,11 +336,12 @@ def stage_smoke(a, data, test):
         sys.exit('20-batch smoke failed')
 
     if not a.dry_run:
-        sf_gate.gate_log(REPO / f'smoke_{TAG}/train.log')
+        sf_gate.gate_log(REPO / f'smoke_{TAG}/train.log', recipe=arm_recipe())
         sf_gate.gate_ckpt(Path(out) / 'best.pt')
         (REPO / f'smoke_{TAG}').mkdir(parents=True, exist_ok=True)
         Path(REPO / f'smoke_{TAG}' / 'OK').write_text(
-            f'{sha16(REPO / "train.py")} {sha16(REPO / "infer.py")} {TAG}\n')
+            f'{sha16(REPO / "train.py")} {sha16(REPO / "infer.py")} '
+            f'{TAG} rank={RECIPE["rank"]} {" ".join(TRAIN_EXTRA)}\n')
     log('SMOKE PASSED')
 
 
@@ -312,16 +351,26 @@ def stage_train(a, data):
     if not a.dry_run:
         if not marker.is_file():
             sys.exit(f'no smoke gate at {marker}; run `python sf_run.py smoke` first')
-        got = marker.read_text().split()[:2]
+        fields = marker.read_text().split()
+        got, got_extra = fields[:2], fields[4:]
+        got_rank = fields[3] if len(fields) > 3 else 'rank=?'
+        if got_rank != f'rank={RECIPE["rank"]}':
+            sys.exit(f'smoke gate was passed at {got_rank} but this run is '
+                     f'rank={RECIPE["rank"]} — the gates validated a different budget. '
+                     f'Re-run `python sf_run.py smoke --tag {TAG} --rank {RECIPE["rank"]}`.')
         if got != [sha16(REPO / 'train.py'), sha16(REPO / 'infer.py')]:
             sys.exit('smoke gate is STALE — train.py/infer.py changed since it passed. '
                      'Re-run `python sf_run.py smoke`.')
+        if got_extra != TRAIN_EXTRA:
+            sys.exit(f'smoke gate was passed for arm {got_extra} but this run is '
+                     f'{TRAIN_EXTRA} — the gates validated a different recipe. '
+                     'Re-run `python sf_run.py smoke --extra "..."`.')
         _assert_gpu_free()
     if run(train_cmd(data, OUT), REPO / f'{OUT}.log', a.dry_run):
         sys.exit('training failed')
     if a.dry_run:
         return
-    sf_gate.gate_log(REPO / f'{OUT}.log')
+    sf_gate.gate_log(REPO / f'{OUT}.log', recipe=arm_recipe())
     sf_gate.gate_ckpt(Path(OUT) / 'best.pt')
 
 
@@ -361,7 +410,30 @@ def main(argv=None):
     p.add_argument('--test', default=os.environ.get('TEST', ''))
     p.add_argument('--dry-run', action='store_true')
     p.add_argument('--no-emit-8v', dest='emit_8v', action='store_false')
-    a = p.parse_args(argv)
+    p.add_argument('--rank', type=int, default=None,
+                   help='override the LoRA rank from RECIPE (e.g. 32 for the '
+                        'reduced-capacity arm).  This moves RECIPE itself so the '
+                        'parameter gates follow it; --extra cannot do that.')
+    p.add_argument('--tag', default='sf_base',
+                   help='arm name; drives outputs_<tag>, sub_<tag>_* and '
+                        'smoke_<tag> so an arm can never overwrite the baseline')
+    p.add_argument('--extra', default='',
+                   help='extra train.py switches for this arm, e.g. '
+                        '--extra="--local-se --junk-filter margin".  Any unrecognised '
+                        'flag is treated the same way, so `sf_run.py train --local-se` '
+                        'works too (argparse cannot take a --prefixed --extra value).')
+    a, extras = p.parse_known_args(argv)
+    global TRAIN_EXTRA, TAG, OUT
+    if a.rank:
+        RECIPE['rank'] = int(a.rank)          # same dict object the gates read
+        log(f'arm: lora rank overridden to {RECIPE["rank"]}')
+    # Unknown flags are the honest way to pass a --prefixed switch: `--extra --local-se`
+    # raises "expected one argument" because argparse reads the value as an option.
+    TRAIN_EXTRA = shlex.split(a.extra) + list(extras)
+    TAG = a.tag
+    OUT = f'outputs_{TAG}'
+    if TRAIN_EXTRA:
+        log(f'arm: tag={TAG} train.py ' + ' '.join(TRAIN_EXTRA))
     a.emit_8v = getattr(a, 'emit_8v', True)
 
     root = Path(a.root)
@@ -377,7 +449,7 @@ def main(argv=None):
         for k, explicit in (('train', a.train), ('test', a.test)):
             p = Path(explicit) if explicit else root / k
             log(f'{k:5s} source: {p} ({"exists" if p.exists() else "MISSING"})')
-        sf_gate.gate_params(sf_gate.SF_CLASSES)
+        sf_gate.gate_params(sf_gate.SF_CLASSES, **plan_param_kwargs())
         log(f'csv: {sf_gate.SF_TEST} rows / {sf_gate.SF_TEST * 43} bytes '
             f'(43 B/row = 36-char name + comma + 4 digits + CRLF)')
         log('--- train ---')
