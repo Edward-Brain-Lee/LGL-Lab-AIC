@@ -333,12 +333,18 @@ def main(a):
             unreadable += int(bad.sum())
     logits = torch.cat(logits)
 
+    # `rows0` is the tau=0 label sequence, kept separately: the loop variable below
+    # ends up holding the LAST tau, which is what the --save-logits self-check must
+    # not compare against (that bug made the self-check fire on a correct run).
+    rows0 = None
     for tau in (a.logit_adjust or [0.0]):
         adj = logits if (not tau or log_prior is None) else logits - tau * log_prior
         rows = [(n, idx_to_label[i]) for n, i in zip(names, adj.argmax(1).tolist())]
         out = adjusted_path(a.output, tau)
         with open(out, 'w', newline='', encoding='utf-8') as f:
             csv.writer(f).writerows(rows)
+        if rows0 is None:
+            rows0 = rows
         print(f'wrote {len(rows)} rows to {out} (logit-adjust tau={tau:g})')
 
     print(f'unreadable images replaced by grey: {unreadable}')
@@ -346,6 +352,26 @@ def main(a):
         print('WARNING: row count does not match the number of test images')
     if len(set(names)) != len(names):
         print('WARNING: duplicate file names found -- the grader may match by name only')
+
+    # Instrumentation only: the same forward pass optionally leaves its logits on
+    # disk, so that post-hoc readouts (per-class bias, kNN, marginal alignment) can
+    # be evaluated WITHOUT a second 70-minute pass.  It never influences the CSV --
+    # the self-check below re-derives the tau=0 rows from the saved array and
+    # refuses to write the file if they differ.
+    if a.save_logits:
+        import numpy as np
+        arr = logits.detach().cpu().numpy().astype('float32')
+        col_label = [idx_to_label[i] for i in range(len(idx_to_label))]
+        np.savez_compressed(a.save_logits, logits=arr,
+                            names=np.array(names), labels=np.array(col_label))
+        redo = [col_label[j] for j in arr.argmax(1)]
+        same = redo == [l for _, l in rows0]
+        print(f'saved logits to {a.save_logits}  shape={arr.shape}  '
+              f'columns={len(col_label)}  argmax==csv: {same}')
+        if not same:
+            raise SystemExit('--save-logits self-check FAILED: argmax(logits) != the '
+                             'tau=0 rows that were just written; the saved array does '
+                             'not describe this submission.')
 
 
 def adjusted_path(base, tau):
@@ -390,6 +416,9 @@ def parse_args(argv=None):
                         'the training set is not, so tau>0 trades head accuracy for tail '
                         'accuracy. Several values give several CSVs from ONE forward pass, e.g. '
                         '--logit-adjust 0 0.25 0.5 1.0')
+    p.add_argument('--save-logits', default='', dest='save_logits',
+                   help='write the tau=0 logits (N x classes) to this .npz for '
+                        'post-hoc analysis; never changes the CSV (self-checked)')
     p.add_argument('--lora-rank', type=int, default=0, help='override (default: as in the checkpoint)')
     p.add_argument('--img-size', type=int, default=0, dest='img_size',
                    help='override the input resolution (default: as recorded in the '

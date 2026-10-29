@@ -25,3 +25,9 @@ submission_*/
 *.docx
 software.code-workspace
 1010.txt
+
+# Submission artifacts and one-off probe output: never commit a results file.
+submit_*.zip
+sub_tau/
+probe_out/
+*.npz

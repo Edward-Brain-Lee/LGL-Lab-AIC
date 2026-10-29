@@ -1600,11 +1600,21 @@ def main(a):
             idx_g = idx.to(device, non_blocking=True)
             bsz = y.numel()
 
+            if a.nan_guard and not (torch.isfinite(x1).all() and torch.isfinite(x2).all()):
+                print(f'[nan-guard] it={it} NONFINITE_INPUT x1_nan={int(torch.isnan(x1).sum())} '
+                      f'x2_nan={int(torch.isnan(x2).sum())} idx={idx[:12].tolist()}')
+                raise SystemExit(1)
+
             need_anchor = a.anchor_weight > 0 or (warm and a.proto_weight > 0)
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
                 anchor = model.anchor_feat(x1) if need_anchor else None   # frozen CLIP, LoRA off
                 out, z = model(x1, True)
+                if a.nan_guard and not torch.isfinite(out).all():
+                    print(f'[nan-guard] it={it} NONFINITE_FORWARD out_nan={int(torch.isnan(out).sum())} '
+                          f'z_nan={int(torch.isnan(z).sum())} anchor_nan={0 if anchor is None else int(torch.isnan(anchor).sum())} '
+                          f'x1_absmax={float(x1.abs().max()):.3f} idx={idx[:12].tolist()}')
+                    raise SystemExit(1)
                 out2, z2 = model(x2, True)
                 with torch.no_grad():
                     tout, tz = teacher(x1, True)        # one view is enough for the teacher
@@ -1699,6 +1709,28 @@ def main(a):
 
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
+            if a.nan_guard:
+                grad_named = list(model.named_parameters())
+                bad = [n for n, p in grad_named if p.requires_grad and p.grad is not None
+                       and not torch.isfinite(p.grad).all()]
+                if bad or not torch.isfinite(loss):
+                    _f = lambda t: bool(torch.isfinite(t).all()) if torch.is_tensor(t) else None
+                    print(f'[nan-guard] it={it} loss={float(loss):.6f} '
+                          f'finite_loss={bool(torch.isfinite(loss))} bad_grad={len(bad)}')
+                    print(f'[nan-guard] terms: out={_f(out)} out2={_f(out2)} z={_f(z)} z2={_f(z2)} '
+                          f'soft={_f(soft)} mix_t={_f(mix_t)} w={_f(w)} ce1={_f(ce1)} ce2={_f(ce2)} '
+                          f'cons={_f(consistency)} anchor={None if anchor is None else _f(anchor)}')
+                    print(f'[nan-guard] x1 absmax={float(x1.abs().max()):.3f} mean={float(x1.mean()):.3f} | '
+                          f'x2 absmax={float(x2.abs().max()):.3f} mean={float(x2.mean()):.3f} '
+                          f'x2_nan={int(torch.isnan(x2).sum())} x2_inf={int(torch.isinf(x2).sum())}')
+                    print(f'[nan-guard] w stats: min={float(w.min()):.4f} max={float(w.max()):.4f} '
+                          f'nan={int(torch.isnan(w).sum())} | soft sum={float(soft.sum(1).mean()):.3f}')
+                    for n in bad[:6]:
+                        g = dict(grad_named)[n].grad
+                        print(f'[nan-guard]   {n}: nan={int(torch.isnan(g).sum())} '
+                              f'inf={int(torch.isinf(g).sum())} '
+                              f'absmax={float(torch.nan_to_num(g).abs().max()):.3e}')
+                    raise SystemExit(1)
             torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
             scaler.step(opt)
             scaler.update()
@@ -1845,6 +1877,9 @@ def parse_args(argv=None):
     p.add_argument('--cudnn-benchmark', action='store_true',
                    help='faster but not bit-reproducible (default: off)')
     p.add_argument('--amp', default='bf16', choices=['bf16', 'fp16', 'none'])
+    p.add_argument('--nan-guard', action='store_true', dest='nan_guard',
+                   help='debug: abort on the first non-finite loss or gradient and ' 
+                        'print which tensors are poisoned')
     p.add_argument('--val-ratio', type=float, default=0.1)
     p.add_argument('--limit-batches', type=int, default=0, help='smoke test: stop after N steps')
     p.add_argument('--sampler', default='balanced', choices=['balanced', 'uniform', 'shuffle'],
