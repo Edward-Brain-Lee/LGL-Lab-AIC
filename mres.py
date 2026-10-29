@@ -104,12 +104,18 @@ def load_checkpoint(path, device):
     img_size = ck.get('img_size', ck_args.get('img_size', 224))
     local_head = bool(ck.get('local_head', ck_args.get('local_head', False)))
     local_attn = bool(ck.get('local_attn', ck_args.get('local_attn', False)))
+    # The attention arms landed after this loader was written; without them an
+    # --local-se / --attn-temp checkpoint loads with its exciter tensors in
+    # `unexpected` and the assertion below fires.  Same read order as infer.py.
+    local_se = bool(ck.get('local_se', ck_args.get('local_se', False)))
+    attn_temp = bool(ck.get('attn_temp', ck_args.get('attn_temp', False)))
 
     clip_model = open_clip.create_model(model_name, pretrained=ck.get('pretrained', 'openai'))
     if img_size != 224:
         resize_positional_embedding(clip_model.visual, img_size)
     model = Net(clip_model, len(ck['classes']), rank, target, local_head=local_head,
-                lora_qkv=lora_qkv, lora_alpha=lora_alpha, local_attn=local_attn)
+                lora_qkv=lora_qkv, lora_alpha=lora_alpha, attn_temp=attn_temp,
+                local_attn=local_attn, local_se=local_se)
     missing, unexpected = model.load_state_dict(ck.get('model', ck), strict=False)
     # `missing` is expected (the frozen backbone is absent by design); `unexpected`
     # is not -- it means the checkpoint holds trained tensors this rebuild cannot
@@ -221,7 +227,8 @@ def evaluate(a):
     # metric, so make it loud instead.
     assert len({p.name for p in files}) == len(files), (
         'the val split has duplicate basenames -- keying labels by name is ambiguous')
-    label = {p.name: y for p, y in va.items}
+    # ImageFolderNoisy.items now stores str paths (train.py:932), not Path objects.
+    label = {Path(p).name: y for p, y in va.items}
     wanted = [p.name for p in files]
     n_cls = len(ck['classes'])
     print(f'hold-out: {len(files)} images, {n_cls} classes')
@@ -292,6 +299,31 @@ def evaluate(a):
                       f'{"COMBINED is better" if z > 2 else "reference is better" if z < -2 else "no decision (|z|<2)"}')
             print(f'  combined vs reference delta {cacc - racc:+.4f} '
                   f'(unpaired 1-sigma is 0.0044 -- this is why the paired test matters)')
+    print('')
+
+    # tau sweep on the hold-out.  `write_submission` already loops over taus; the
+    # val path did not, so a tau could not be chosen offline.  Read the winner by
+    # **macro** recall: the delivered test set is class-balanced (runbook §3) while
+    # this split is not (10..221 images/class), so micro rewards the head classes
+    # that logit adjustment deliberately trades away.  Micro is printed only for
+    # continuity with the `val_acc` train.py logs.
+    counts = torch.as_tensor(ck.get('class_counts') or [], dtype=torch.float32)
+    log_prior = None
+    if counts.numel() == len(ck['classes']):
+        log_prior = (counts / counts.sum().clamp_min(1.0)).clamp_min(1e-12).log()
+    base_logits = combine(per_res).log()
+    print('  logit-adjust sweep (same forward pass, re-argmax only):')
+    print(f'    {"tau":>6} {"micro":>8} {"macro":>8} {"pred_cls":>9}')
+    for tau in (a.logit_adjust or [0.0]):
+        adj = base_logits if (not tau or log_prior is None) else base_logits - tau * log_prior
+        p = adj.argmax(1)
+        micro = float((p == y).float().mean())
+        hit = torch.zeros(n_cls).index_add_(0, y, (p == y).float())
+        tot = torch.zeros(n_cls).index_add_(0, y, torch.ones_like(y, dtype=torch.float32))
+        macro = float((hit / tot.clamp_min(1)).mean())
+        print(f'    {tau:>6g} {micro:>8.4f} {macro:>8.4f} {int(p.unique().numel()):>9}')
+    if log_prior is None:
+        print('    (no class_counts in checkpoint -- tau is a no-op)')
     print('')
 
 
